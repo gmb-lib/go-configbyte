@@ -1,0 +1,75 @@
+# CI for a Go library: build · vet · golangci-lint · govulncheck · race tests +
+# coverage, plus a short fuzz sweep over any Fuzz* targets. Publishing happens on
+# a GitHub release (release.yml), not here, so there is no image job.
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod          # single source of truth
+          cache: true
+          cache-dependency-path: go.sum
+
+      - run: go mod download
+      - run: go mod verify
+      - run: go mod tidy -diff
+
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.1
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  # Short fuzz sweep — every Fuzz* target runs 30s so an untrusted-input parser
+  # never regresses to a panic. No-op when the module has no fuzz targets. Loops
+  # per package, never a bare `./...` — `go test -fuzz` rejects a package pattern
+  # that expands to more than one package, which a multi-package module always
+  # does (bit previewbyte: "cannot use -fuzz flag with multiple packages").
+  fuzz-short:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Fuzz (30s per target)
+        run: |
+          for pkg in $(go list ./...); do
+            targets=$(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz' || true)
+            for t in $targets; do
+              go test -run '^$' -fuzz "^${t}\$" -fuzztime 30s "$pkg"
+            done
+          done
