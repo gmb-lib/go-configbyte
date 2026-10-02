@@ -3,10 +3,12 @@
 // service's own routes, from the service's own tests, with its own section.
 //
 // [Gates] runs with no database behind the service. It proves each operation is
-// where the contract puts it and guarded as the contract says: nothing answers
-// without a token, the section answer needs no tenant, readers reach the store,
-// writers reach it and non-writers do not, an apply naming no version is refused
-// before the store is asked, and the reasons render as themselves.
+// where the contract puts it and guarded as the contract says: nothing but the
+// section answer answers without a token, the section answer needs none and
+// names what a token for the service carries, readers reach the store, writers
+// reach it and non-writers do not, only a writer may read the section as an
+// export, an apply naming no version is refused before the store is asked, and
+// the reasons render as themselves.
 //
 // [Live] runs against a real store. It walks the contract end to end: the section
 // read with its version as the ETag, a document that changes nothing previewed
@@ -14,7 +16,10 @@
 // make — each reported alike by the preview and the apply, each writing nothing,
 // not even the clean item beside it — a real change previewed without landing
 // and applied landing, an apply against a moved version refused, another tenant
-// holding another section, and a document that is not this section refused.
+// holding another section, and a document that is not this section refused —
+// and every transport recorded in the owner's own history: one line for each
+// export and each apply that was not refused, carrying the part's hash and, for
+// an import, the document's.
 //
 // Both take the callers as the service's own test client presents them, so the
 // ladder never needs to know how the service authenticates.
@@ -49,6 +54,14 @@ type Service struct {
 	Domain string
 	// RefersTo names the sections this section refers to.
 	RefersTo []string
+	// Audience and ScopeKeys are what the section answer says a token for the
+	// service carries.
+	Audience  string
+	ScopeKeys []string
+}
+
+func (s Service) purpose(p string) azugo.TestClientOption {
+	return s.Client.WithHeader(contract.HeaderPurpose, p)
 }
 
 // reply is one answer, read whole.
@@ -89,7 +102,7 @@ func (s Service) ifMatch(version string) azugo.TestClientOption {
 type Gates struct {
 	Service
 	// Anyone is a caller with a valid token, no tenant and nothing of this
-	// service: the section answer is theirs.
+	// service: the section answer is theirs, as it is a caller's with no token.
 	Anyone Caller
 	// Readers must each pass the gate of both reads.
 	Readers []Caller
@@ -117,24 +130,29 @@ func (g Gates) Run(t testing.TB) {
 	doc := []byte(`{"schema":"` + contract.Schema(g.Section) + `"}`)
 	get, post := fasthttp.MethodGet, fasthttp.MethodPost
 
-	// Nothing answers without a token.
-	for _, path := range []string{contract.PathConfig, contract.PathVersion, contract.PathSection} {
+	// Nothing but the section answer answers without a token.
+	for _, path := range []string{contract.PathConfig, contract.PathVersion} {
 		qt.Check(t, qt.Equals(g.call(t, get, path, nil, nil).status, fasthttp.StatusUnauthorized), qt.Commentf("GET %s without a token", path))
 	}
 	for _, path := range []string{contract.PathPreview, contract.PathApply} {
 		qt.Check(t, qt.Equals(g.call(t, post, path, doc, nil).status, fasthttp.StatusUnauthorized), qt.Commentf("POST %s without a token", path))
 	}
 
-	// Which section answers here needs no tenant and no person.
+	// Which section answers here needs no token, no tenant and no person, and
+	// names what a token for the service carries.
 	refs := g.RefersTo
 	if refs == nil {
 		refs = []string{}
 	}
-	want, err := json.Marshal(contract.SectionAnswer{Section: g.Section, Schema: contract.Schema(g.Section), RefersTo: refs})
+	want, err := json.Marshal(contract.SectionAnswer{Section: g.Section, Schema: contract.Schema(g.Section), RefersTo: refs,
+		Audience: g.Audience, ScopeKeys: g.ScopeKeys})
 	qt.Assert(t, qt.IsNil(err))
-	got := g.call(t, get, contract.PathSection, nil, g.Anyone)
-	qt.Check(t, qt.Equals(got.status, fasthttp.StatusOK), qt.Commentf("the section answer: %s", got.raw))
-	qt.Check(t, qt.Equals(got.raw, string(want)), qt.Commentf("the section answer names the section, its schema and its references"))
+	for name, who := range map[string]Caller{"no token": nil, "anyone": g.Anyone} {
+		got := g.call(t, get, contract.PathSection, nil, who)
+		qt.Check(t, qt.Equals(got.status, fasthttp.StatusOK), qt.Commentf("the section answer, %s: %s", name, got.raw))
+		qt.Check(t, qt.Equals(got.raw, string(want)),
+			qt.Commentf("the section answer, %s, names the section, its schema, its references, its audience and its scope keys", name))
+	}
 
 	for i, c := range g.Readers {
 		for _, path := range []string{contract.PathConfig, contract.PathVersion} {
@@ -151,6 +169,10 @@ func (g Gates) Run(t testing.TB) {
 			got := g.call(t, post, path, doc, c, g.ifMatch("sha256:x"))
 			qt.Check(t, qt.Equals(got.status, fasthttp.StatusForbidden), qt.Commentf("refused %d: POST %s: %s", i, path, got.raw))
 		}
+		// Taking the section out as an export is the administrator's too: it
+		// writes a line in the owner's history.
+		got := g.call(t, get, contract.PathConfig, nil, c, g.purpose(contract.PurposeExport))
+		qt.Check(t, qt.Equals(got.status, fasthttp.StatusForbidden), qt.Commentf("refused %d: an export read: %s", i, got.raw))
 	}
 	for i, c := range g.Writers {
 		// A preview needs no version; an apply naming one — strong or weak —
@@ -163,6 +185,13 @@ func (g Gates) Run(t testing.TB) {
 		got := g.call(t, post, contract.PathApply, doc, c)
 		qt.Check(t, qt.Equals(got.status, fasthttp.StatusPreconditionRequired), qt.Commentf("writer %d: an apply naming no version: %s", i, got.raw))
 		qt.Check(t, qt.StringContains(got.raw, contract.Code(g.Domain, contract.ReasonVersionRequired)), qt.Commentf("writer %d", i))
+
+		// A writer may read the section as an export; a purpose the contract
+		// does not know is refused before the store, never read as a plain read.
+		got = g.call(t, get, contract.PathConfig, nil, c, g.purpose(contract.PurposeExport))
+		qt.Check(t, qt.Equals(got.status, unready), qt.Commentf("writer %d: an export read reaches the store: %s", i, got.raw))
+		got = g.call(t, get, contract.PathConfig, nil, c, g.purpose("backup"))
+		qt.Check(t, qt.Equals(got.status, fasthttp.StatusBadRequest), qt.Commentf("writer %d: an unknown purpose: %s", i, got.raw))
 	}
 
 	Reasons(t, g.Domain)

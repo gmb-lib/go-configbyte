@@ -27,7 +27,7 @@ variants:
 | `POST` | `<root>/config/preview` | exactly what a document would change, item by item — **writes nothing** |
 | `POST` | `<root>/config/apply` | the change, **atomically and idempotently**, naming its version in **`If-Match`** |
 | `GET` | `<root>/config/version` | the version alone: the cheap "has anything changed?" |
-| `GET` | `<root>/config/section` | which section answers here and which sections it refers to — **no tenant, no person** |
+| `GET` | `<root>/config/section` | which section answers here, which sections it refers to, and the audience and scope keys a token for the service carries — **no token, no tenant, no person** |
 
 And the rules behind them:
 
@@ -46,6 +46,11 @@ And the rules behind them:
   valid for everything that already names it — because no check across two services can be atomic with a removal.
 - **Reads are every member's**, because the section is the vocabulary everybody works in and holds nobody's
   records. **Writes are the administrator's.**
+- **Every transport is recorded by its owner, in its own history.** A read sent with `Config-Purpose: export` is
+  answered exactly as the read is, and only once the owner has recorded who took its part out and the part's hash;
+  only a caller who may apply the section may make it. An apply records the part's hash and the document's content
+  hash, which the caller names in `Config-Document`. A part's hash is taken the way the document's content hash
+  takes each section, so a line in the history can be matched to the file.
 
 ## Packages
 
@@ -60,15 +65,17 @@ And the rules behind them:
 
 ## Owning a section
 
-The service brings its store — the one place that reads its section and writes a document — and its gate. The
-store answers the section and its version from one snapshot, and compares an apply's version with the section's
-own under a per-tenant lock.
+The service brings its store — the one place that reads its section, writes a document and records each
+transport in its history — and its gate. The store answers the section and its version from one snapshot, compares
+an apply's version with the section's own under a per-tenant lock, and records the hashes it is handed on the line
+it writes for the apply.
 
 ```go
 type Store interface {
 	ConfigRead(ctx context.Context, tenant string) (configserver.Read, error)
 	ConfigVersion(ctx context.Context, tenant string) (string, error)
-	ConfigApply(ctx context.Context, a configserver.Apply) (json.RawMessage, error)
+	ConfigApply(ctx context.Context, a configserver.Apply) (json.RawMessage, error) // a.PartHash, a.Document
+	ConfigExported(ctx context.Context, e configserver.Export) error                 // who took the part out, its hash
 }
 ```
 
@@ -77,20 +84,30 @@ type Store interface {
 var Permissions = permissions.MustNew("orders", "Orders", own, configserver.Permissions())
 
 owner := &configserver.Owner{
-	Section: "orders",                 // travels as "orders-config/1"
-	Domain:  "orders",                 // refusals are "err:orders:…"
-	Gate:    Permissions.Gate(deny),
-	Read:    permissions.Levels("orders", "read"),
-	Write:   configserver.ImportRule(Permissions, permissions.Levels("orders", "admin")),
-	Tenant:  tenantOf, // the caller's tenant, or the refusal written
-	Actor:   actorOf,  // who a change is attributed to
-	Store:   storeOf,  // the store, or "not ready" written
-	Applied: recordConfigChange,
+	Section:   "orders",           // travels as "orders-config/1"
+	Audience:  "svc:orders",       // the audience a token for this service carries
+	ScopeKeys: []string{"orders"}, // the keys of every scope its routes check
+	Domain:    "orders",           // refusals are "err:orders:…"
+	Gate:      Permissions.Gate(deny),
+	Read:      permissions.Levels("orders", "read"),
+	Write:     configserver.ImportRule(Permissions, permissions.Levels("orders", "admin")),
+	Tenant:    tenantOf, // the caller's tenant, or the refusal written
+	Actor:     actorOf,  // who a change is attributed to
+	Store:     storeOf,  // the store, or "not ready" written
+	Applied:   recordConfigChange,
 }
-if err := owner.Mount(v1); err != nil { // v1: the router group at "/api/v1", behind authentication
+
+v1 := app.Group("/api/v1")
+v1.Use(app.AuthMiddleware())
+open := app.Group("/api/v1") // the same root, no authentication: only the section answer is mounted here
+if err := owner.Mount(v1, open); err != nil {
 	return err
 }
 ```
+
+The section answer needs no token because it is asked before the asker holds one: a coordinator given nothing but
+the service's address learns from it which audience to ask a token for, and which of a person's scopes to ask it
+with. It says nothing about any tenant.
 
 A person always reads; a service acting as itself reads by the reading rung or any permission the service
 declares. A person writes by the permissions of the write rule and never by a rung; a service acting as itself by
@@ -134,7 +151,8 @@ Whether a caller may be answered a section at all is decided before the cache is
 ```go
 func TestTheConfigurationContract(t *testing.T) {
 	configtest.Gates{
-		Service:    configtest.Service{Client: client, Root: "/api/v1", Section: "orders", Domain: "orders"},
+		Service: configtest.Service{Client: client, Root: "/api/v1", Section: "orders", Domain: "orders",
+			Audience: "svc:orders", ScopeKeys: []string{"orders"}},
 		Anyone:     tokenWithoutTenant,
 		Readers:    []configtest.Caller{member, readingService},
 		Unreadable: []configtest.Caller{anotherServicesMachine},
@@ -145,8 +163,9 @@ func TestTheConfigurationContract(t *testing.T) {
 ```
 
 `configtest.Live` walks the rest against a real store: the unchanged document that moves nothing, the service's
-own refusals — each reported alike by preview and apply, each writing nothing — a real change, a stale apply, and
-another tenant's section.
+own refusals — each reported alike by preview and apply, each writing nothing — a real change, a stale apply,
+another tenant's section, and the record of every transport, which it reads through the service's own history
+(`Exports` and `Imports`).
 
 ## Dependencies
 

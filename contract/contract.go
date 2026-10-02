@@ -24,6 +24,7 @@ package contract
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -46,10 +47,27 @@ const (
 	// PathVersion (GET) answers the version alone: the cheap "has anything
 	// changed?".
 	PathVersion = "/config/version"
-	// PathSection (GET) answers which section this owner holds and which
-	// sections it refers to. It needs no tenant and no person, and says
-	// nothing about any tenant's configuration.
+	// PathSection (GET) answers which section this owner holds, which sections
+	// it refers to, and what a token for this owner carries. It needs no token,
+	// no tenant and no person, and says nothing about any tenant's
+	// configuration: a coordinator asks it at start, before it holds any
+	// credential for the owner.
 	PathSection = "/config/section"
+)
+
+// The two headers a coordinator names a transport with, so that each owner
+// records the transport of its own part in its own history.
+const (
+	// HeaderPurpose on a section read names the read as part of an export. The
+	// owner answers exactly what the read answers, and records who took its part
+	// out and the part's hash. Only a caller who may apply the section may make
+	// it, so an export that could not be recorded is never made.
+	HeaderPurpose = "Config-Purpose"
+	// PurposeExport is the one purpose a section read names.
+	PurposeExport = "export"
+	// HeaderDocument on an apply names the content hash of the document the
+	// section arrived in, so the owner's record of the import names the file.
+	HeaderDocument = "Config-Document"
 )
 
 // SchemaSuffix follows a section's name to make the name its payload carries:
@@ -90,6 +108,26 @@ func Token(schema, scope string, section []byte) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
+// PartHash is "sha256:" and the hex SHA-256 over one section as it travels:
+// compacted, and escaped as a JSON encoder writes it. It is the form each
+// section takes inside a document's content hash, so a part read from a file —
+// however the file was indented — hashes to the value its owner recorded when
+// the part was exported or applied.
+func PartHash(section []byte) string {
+	canonical, err := json.Marshal(json.RawMessage(section))
+	if err != nil {
+		canonical = section
+	}
+	sum := sha256.Sum256(canonical)
+
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+var hashShape = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// ValidHash reports whether s has the shape of a part hash or a content hash.
+func ValidHash(s string) bool { return hashShape.MatchString(s) }
+
 // ETag renders a version as the entity tag a section read carries.
 func ETag(version string) string { return `"` + version + `"` }
 
@@ -109,27 +147,45 @@ type VersionAnswer struct {
 }
 
 // SectionAnswer is the body of a section read: which section this owner holds,
-// the name its payload carries, and the sections its own section refers to. A
-// section that names another section's keys refers to it, and an import applies
-// it after every section it refers to.
+// the name its payload carries, the sections its own section refers to, and
+// what a token for this owner carries. A section that names another section's
+// keys refers to it, and an import applies it after every section it refers
+// to.
+//
+// Audience is the audience a token for this owner must name, and ScopeKeys are
+// the keys of every scope its routes check — its ladder's groups and its
+// permissions' service key. A coordinator calling the owner on a person's
+// behalf asks for exactly the person's scopes under those keys, and learns
+// both here because it holds no credential for the owner until it knows them.
 type SectionAnswer struct {
-	Section  string   `json:"section"`
-	Schema   string   `json:"schema"`
-	RefersTo []string `json:"refersTo"`
+	Section   string   `json:"section"`
+	Schema    string   `json:"schema"`
+	RefersTo  []string `json:"refersTo"`
+	Audience  string   `json:"audience"`
+	ScopeKeys []string `json:"scopeKeys"`
 }
 
-// NewSectionAnswer builds the answer for a section and the sections it refers
-// to, checked as [SectionAnswer.Check] checks it.
-func NewSectionAnswer(section string, refersTo ...string) (SectionAnswer, error) {
-	a := SectionAnswer{Section: section, Schema: Schema(section), RefersTo: append([]string{}, refersTo...)}
+// NewSectionAnswer builds the answer for a section, the audience its owner's
+// tokens carry, the keys of the scopes its routes check and the sections it
+// refers to, checked as [SectionAnswer.Check] checks it.
+func NewSectionAnswer(section, audience string, scopeKeys, refersTo []string) (SectionAnswer, error) {
+	a := SectionAnswer{
+		Section: section, Schema: Schema(section), RefersTo: append([]string{}, refersTo...),
+		Audience: audience, ScopeKeys: append([]string{}, scopeKeys...),
+	}
 
 	return a, a.Check()
 }
 
+// maxAudience bounds an audience, which travels in every token for the owner.
+const maxAudience = 256
+
 // Check reports what is wrong with an answer: a section name out of shape, a
-// schema that is not the section's own, or a reference that is out of shape,
-// named twice, or names the section itself. A coordinator that reads an answer
-// failing it has been given an address that is not a configuration owner.
+// schema that is not the section's own, a reference that is out of shape,
+// named twice, or names the section itself, an audience that is missing or out
+// of shape, or scope keys missing, out of shape or named twice. A coordinator
+// that reads an answer failing it has been given an address that is not a
+// configuration owner it can call.
 func (a SectionAnswer) Check() error {
 	var errs []error
 	if !ValidName(a.Section) {
@@ -137,6 +193,22 @@ func (a SectionAnswer) Check() error {
 	}
 	if a.Schema != Schema(a.Section) {
 		errs = append(errs, fmt.Errorf("configuration: section %q travels as %q, not %q", a.Section, Schema(a.Section), a.Schema))
+	}
+	if a.Audience == "" || len(a.Audience) > maxAudience || strings.ContainsAny(a.Audience, " \t\r\n") {
+		errs = append(errs, fmt.Errorf("configuration: section %q does not say which audience its owner's tokens carry", a.Section))
+	}
+	if len(a.ScopeKeys) == 0 {
+		errs = append(errs, fmt.Errorf("configuration: section %q does not say which scope keys its owner checks", a.Section))
+	}
+	keys := map[string]bool{}
+	for _, k := range a.ScopeKeys {
+		switch {
+		case !ValidName(k):
+			errs = append(errs, fmt.Errorf("configuration: section %q names %q as a scope key, which is not one", a.Section, k))
+		case keys[k]:
+			errs = append(errs, fmt.Errorf("configuration: section %q names the scope key %q twice", a.Section, k))
+		}
+		keys[k] = true
 	}
 	if a.RefersTo == nil {
 		errs = append(errs, fmt.Errorf("configuration: section %q does not say which sections it refers to", a.Section))

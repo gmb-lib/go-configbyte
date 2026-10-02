@@ -33,6 +33,20 @@ type Live struct {
 	Landed func(t testing.TB) bool
 	// Change is one real change.
 	Change Change
+
+	// Exports answers the part hashes of the export lines the owner has
+	// recorded in its history for Admin's tenant, oldest first, and Imports the
+	// hashes on its import lines. Both are required: every owner records each
+	// transport of its part.
+	Exports func(t testing.TB) []string
+	Imports func(t testing.TB) []Import
+}
+
+// Import is what one import line in the owner's history carries.
+type Import struct {
+	// PartHash is the hash of the part as it arrived, Document the content hash
+	// of the document it arrived in, or "" when the apply named none.
+	PartHash, Document string
 }
 
 // Refusal is one document the owner must refuse.
@@ -64,6 +78,11 @@ func (l Live) Run(t testing.TB) {
 	t.Helper()
 	get, post := fasthttp.MethodGet, fasthttp.MethodPost
 	schema := contract.Schema(l.Section)
+	if l.Exports == nil || l.Imports == nil {
+		t.Fatal("configtest.Live needs Exports and Imports: every owner records each transport of its part in its own history")
+
+		return
+	}
 
 	version := func() string {
 		t.Helper()
@@ -86,6 +105,36 @@ func (l Live) Run(t testing.TB) {
 	qt.Check(t, qt.IsFalse(strings.Contains(read.raw, `"id"`)), qt.Commentf("the section carries keys, never identifiers"))
 	qt.Check(t, qt.IsFalse(strings.Contains(read.raw, `"createdAt"`)), qt.Commentf("the section carries no timestamps"))
 	section := read.raw
+
+	// ---- An export: answered as the read is, and recorded once ----
+	exports := l.Exports(t)
+	plain := l.call(t, get, contract.PathConfig, nil, l.Admin)
+	qt.Assert(t, qt.Equals(plain.status, fasthttp.StatusOK), qt.Commentf("the administrator's read: %s", plain.raw))
+	qt.Check(t, qt.HasLen(l.Exports(t), len(exports)), qt.Commentf("a plain read recorded an export"))
+	export := l.call(t, get, contract.PathConfig, nil, l.Admin, l.purpose(contract.PurposeExport))
+	qt.Assert(t, qt.Equals(export.status, fasthttp.StatusOK), qt.Commentf("the export read: %s", export.raw))
+	qt.Check(t, qt.Equals(export.raw, plain.raw), qt.Commentf("an export answers what the read answers"))
+	qt.Check(t, qt.Equals(export.etag, plain.etag))
+	recorded := l.Exports(t)
+	qt.Assert(t, qt.HasLen(recorded, len(exports)+1), qt.Commentf("an export leaves exactly one line"))
+	qt.Check(t, qt.Equals(recorded[len(recorded)-1], contract.PartHash([]byte(export.raw))),
+		qt.Commentf("the line carries the hash of the part the exporter received"))
+	refusedExport := l.call(t, get, contract.PathConfig, nil, l.NonAdmin, l.purpose(contract.PurposeExport))
+	qt.Check(t, qt.Equals(refusedExport.status, fasthttp.StatusForbidden), qt.Commentf("a member who does not administer exported: %s", refusedExport.raw))
+	qt.Check(t, qt.HasLen(l.Exports(t), len(recorded)), qt.Commentf("a refused export left a line"))
+
+	imports := func() int {
+		t.Helper()
+
+		return len(l.Imports(t))
+	}
+	lastImport := func() Import {
+		t.Helper()
+		all := l.Imports(t)
+		qt.Assert(t, qt.Not(qt.HasLen(all, 0)), qt.Commentf("no import line"))
+
+		return all[len(all)-1]
+	}
 
 	edit := func(f func(doc map[string]any)) []byte {
 		t.Helper()
@@ -111,8 +160,12 @@ func (l Live) Run(t testing.TB) {
 			qt.Check(t, qt.Equals(fmt.Sprint(it["status"]), string(contract.Unchanged)), qt.Commentf("%s: %v", part, it))
 		}
 	}
+	before := imports()
 	applied := l.call(t, post, contract.PathApply, []byte(section), l.Admin, l.ifMatch(version()))
 	qt.Assert(t, qt.Equals(applied.status, fasthttp.StatusOK), qt.Commentf("the unchanged apply: %s", applied.raw))
+	qt.Check(t, qt.Equals(imports(), before+1), qt.Commentf("an apply that was not refused leaves exactly one line, even one that changed nothing"))
+	qt.Check(t, qt.Equals(lastImport(), Import{PartHash: contract.PartHash([]byte(section))}),
+		qt.Commentf("the line carries the part's hash, and no document when the apply named none"))
 	qt.Check(t, qt.Equals(fmt.Sprint(applied.body["applied"]), "true"))
 	qt.Check(t, qt.Equals(fmt.Sprint(applied.body["version"]), v0), qt.Commentf("an unchanged idempotent apply never moves the token"))
 	qt.Check(t, qt.Equals(version(), v0))
@@ -122,6 +175,7 @@ func (l Live) Run(t testing.TB) {
 	qt.Check(t, qt.Equals(l.call(t, post, contract.PathApply, []byte(section), l.NonAdmin, l.ifMatch(v0)).status, fasthttp.StatusForbidden))
 
 	// ---- The owner's refusals: preview and apply agree, and nothing moves ----
+	before = imports()
 	for _, row := range l.Refusals {
 		doc := edit(func(d map[string]any) {
 			row.Edit(d)
@@ -157,6 +211,7 @@ func (l Live) Run(t testing.TB) {
 			qt.Check(t, qt.IsFalse(l.Landed(t)), qt.Commentf("%s: the clean item beside the refusal was written", row.Name))
 		}
 	}
+	qt.Check(t, qt.Equals(imports(), before), qt.Commentf("a refused document left an import line"))
 
 	// ---- A real change: previewed without landing, then applied ----
 	changed := edit(l.Change.Edit)
@@ -169,8 +224,13 @@ func (l Live) Run(t testing.TB) {
 		qt.Check(t, qt.IsFalse(l.Change.Landed(t)), qt.Commentf("a preview wrote the change where the screens read"))
 	}
 
-	app := l.call(t, post, contract.PathApply, changed, l.Admin, l.ifMatch(version()))
+	file := contract.PartHash([]byte("the document " + l.Section + " arrived in"))
+	before = imports()
+	app := l.call(t, post, contract.PathApply, changed, l.Admin, l.ifMatch(version()), l.Client.WithHeader(contract.HeaderDocument, file))
 	qt.Assert(t, qt.Equals(app.status, fasthttp.StatusOK), qt.Commentf("the change applied: %s", app.raw))
+	qt.Check(t, qt.Equals(imports(), before+1), qt.Commentf("the change left exactly one import line"))
+	qt.Check(t, qt.Equals(lastImport(), Import{PartHash: contract.PartHash(changed), Document: file}),
+		qt.Commentf("the import line names the part and the document it arrived in"))
 	qt.Assert(t, qt.Equals(fmt.Sprint(app.body["applied"]), "true"), qt.Commentf("%s", app.raw))
 	line := item(t, app.body, l.Change.Part, l.Change.Index)
 	qt.Check(t, qt.Equals(fmt.Sprint(line["status"]), string(contract.Changed)))
@@ -185,6 +245,7 @@ func (l Live) Run(t testing.TB) {
 	}
 
 	// ---- An apply lands only on the configuration it was previewed against ----
+	before = imports()
 	none := l.call(t, post, contract.PathApply, []byte(section), l.Admin)
 	qt.Check(t, qt.Equals(none.status, fasthttp.StatusPreconditionRequired), qt.Commentf("%s", none.raw))
 	qt.Check(t, qt.Equals(fmt.Sprint(none.body["code"]), contract.Code(l.Domain, contract.ReasonVersionRequired)))
@@ -193,6 +254,7 @@ func (l Live) Run(t testing.TB) {
 	qt.Check(t, qt.Equals(fmt.Sprint(stale.body["code"]), contract.Code(l.Domain, contract.ReasonVersionMoved)))
 	qt.Check(t, qt.Not(qt.Equals(fmt.Sprint(stale.body["title"]), "")), qt.Commentf("the refusal carries a public title: %s", stale.raw))
 	qt.Check(t, qt.Equals(version(), v1), qt.Commentf("a stale apply moved the configuration"))
+	qt.Check(t, qt.Equals(imports(), before), qt.Commentf("an apply refused for its version left an import line"))
 	if l.Change.Landed != nil {
 		qt.Check(t, qt.IsTrue(l.Change.Landed(t)), qt.Commentf("a stale apply undid the change"))
 	}
