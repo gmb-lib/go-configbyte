@@ -43,10 +43,13 @@ type owner struct {
 	mu   sync.Mutex
 	held map[string]map[string][]match.Entry // tenant → list → items, in order
 	flaw string
+	// The owner's history of transports: tenant → the lines, oldest first.
+	exports map[string][]string
+	imports map[string][]configtest.Import
 }
 
 func newOwner(flaw string) *owner {
-	return &owner{flaw: flaw, held: map[string]map[string][]match.Entry{
+	return &owner{flaw: flaw, exports: map[string][]string{}, imports: map[string][]configtest.Import{}, held: map[string]map[string][]match.Entry{
 		"tenant-live": {
 			"priorities": {{"key": "high", "label": "High", "status": "active"}},
 			"fields":     {{"key": "weight", "label": "Weight", "fieldType": "number", "unit": "kg", "status": "active"}},
@@ -96,6 +99,30 @@ func (o *owner) ConfigVersion(ctx context.Context, tenant string) (string, error
 	return r.Version, err
 }
 
+func (o *owner) ConfigExported(_ context.Context, e configserver.Export) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.flaw != "exportUnrecorded" {
+		o.exports[e.Tenant] = append(o.exports[e.Tenant], e.PartHash)
+	}
+
+	return nil
+}
+
+func (o *owner) exported(tenant string) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return append([]string{}, o.exports[tenant]...)
+}
+
+func (o *owner) imported(tenant string) []configtest.Import {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return append([]configtest.Import{}, o.imports[tenant]...)
+}
+
 func (o *owner) ConfigApply(_ context.Context, a configserver.Apply) (json.RawMessage, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -135,6 +162,15 @@ func (o *owner) ConfigApply(_ context.Context, a configserver.Apply) (json.RawMe
 			for _, j := range judged[name] {
 				o.put(a.Tenant, name, j)
 			}
+		}
+	}
+	if !a.DryRun && !refused {
+		switch o.flaw {
+		case "importUnrecorded":
+		case "importWithoutDocument":
+			o.imports[a.Tenant] = append(o.imports[a.Tenant], configtest.Import{PartHash: a.PartHash})
+		default:
+			o.imports[a.Tenant] = append(o.imports[a.Tenant], configtest.Import{PartHash: a.PartHash, Document: a.Document})
 		}
 	}
 
@@ -178,11 +214,19 @@ var set = permissions.MustNew("orders", "Orders", []permissions.Permission{
 // serve mounts the owner behind a stub authentication driven by headers.
 func serve(t *testing.T, store configserver.Store, ready bool, edit func(o *configserver.Owner)) *azugo.TestClient {
 	t.Helper()
+
+	return mount(t, store, ready, edit, false)
+}
+
+// mount is serve, and with sectionBehindToken the section answer mounted behind
+// the authentication like the other four — the mistake the ladder must catch.
+func mount(t *testing.T, store configserver.Store, ready bool, edit func(o *configserver.Owner), sectionBehindToken bool) *azugo.TestClient {
+	t.Helper()
 	a := azugo.NewTestApp()
 	a.AppName = "orders"
 	a.RouterOptions().ErrorHandler = pkerrors.Handler(a.AppName, false)
 	o := &configserver.Owner{
-		Section: section, Domain: section, Gate: set.Gate(nil),
+		Section: section, Audience: "svc:orders", ScopeKeys: []string{"orders"}, Domain: section, Gate: set.Gate(nil),
 		Read:  permissions.Levels("orders", "read"),
 		Write: configserver.ImportRule(set, permissions.Levels("orders", "admin")),
 		Tenant: func(ctx *azugo.Context) (string, bool) {
@@ -228,7 +272,11 @@ func serve(t *testing.T, store configserver.Store, ready bool, edit func(o *conf
 			next(ctx)
 		}
 	})
-	qt.Assert(t, qt.IsNil(o.Mount(v1)))
+	open := a.Group("/api/v1")
+	if sectionBehindToken {
+		open = v1
+	}
+	qt.Assert(t, qt.IsNil(o.Mount(v1, open)))
 	a.Start(t)
 	t.Cleanup(a.Stop)
 
@@ -249,8 +297,9 @@ func as(c *azugo.TestClient, scopes, sub, tenant string) configtest.Caller {
 
 func gates(c *azugo.TestClient) configtest.Gates {
 	return configtest.Gates{
-		Service: configtest.Service{Client: c, Root: "/api/v1", Section: section, Domain: section},
-		Anyone:  as(c, "anything", "svc:coordinator", ""),
+		Service: configtest.Service{Client: c, Root: "/api/v1", Section: section, Domain: section,
+			Audience: "svc:orders", ScopeKeys: []string{"orders"}},
+		Anyone: as(c, "anything", "svc:coordinator", ""),
 		Readers: []configtest.Caller{
 			as(c, "orders/order:view", "", "tenant-a"),
 			as(c, "other/thing:do", "", "tenant-a"),
@@ -310,6 +359,8 @@ func live(c *azugo.TestClient, o *owner) configtest.Live {
 			Detail: "label",
 			Landed: func(testing.TB) bool { return o.holds("tenant-live", "priorities", "high", "Urgent") },
 		},
+		Exports: func(testing.TB) []string { return o.exported("tenant-live") },
+		Imports: func(testing.TB) []configtest.Import { return o.imported("tenant-live") },
 	}
 }
 
@@ -369,7 +420,8 @@ func ladderFails(t *testing.T, run func(tb testing.TB)) (bool, string) {
 
 // Each owner below breaks the contract in one way, and the ladder must say so.
 func TestTheLadderFailsAnOwnerThatBreaksTheContract(t *testing.T) {
-	for _, flaw := range []string{"identifiers", "frozen", "ignoresVersion", "previewWrites", "refusedWrites", "applyDiffers"} {
+	for _, flaw := range []string{"identifiers", "frozen", "ignoresVersion", "previewWrites", "refusedWrites", "applyDiffers",
+		"exportUnrecorded", "importUnrecorded", "importWithoutDocument"} {
 		o := newOwner(flaw)
 		c := serve(t, o, true, nil)
 		failed, why := ladderFails(t, func(tb testing.TB) { live(c, o).Run(tb) })
@@ -388,12 +440,27 @@ func TestTheLadderFailsAnOwnerThatBreaksTheContract(t *testing.T) {
 			o.IsMachine = func(*azugo.Context) bool { return true }
 		},
 		"references it does not have": func(o *configserver.Owner) { o.RefersTo = []string{"stock"} },
+		"another audience":            func(o *configserver.Owner) { o.Audience = "svc:stock" },
+		"a scope key it does not say": func(o *configserver.Owner) { o.ScopeKeys = []string{"orders", "stock"} },
 	} {
 		c := serve(t, nil, false, edit)
 		failed, why := ladderFails(t, func(tb testing.TB) { gates(c).Run(tb) })
 		qt.Check(t, qt.IsTrue(failed), qt.Commentf("an owner where %s passed the gates ladder", name))
 		t.Logf("%s: %s", name, brief(why))
 	}
+
+	behind := mount(t, nil, false, nil, true)
+	failed, why := ladderFails(t, func(tb testing.TB) { gates(behind).Run(tb) })
+	qt.Check(t, qt.IsTrue(failed), qt.Commentf("an owner whose section answer needs a token passed the gates ladder"))
+	t.Logf("the section answer behind a token: %s", brief(why))
+
+	o := newOwner("")
+	c := serve(t, o, true, nil)
+	l := live(c, o)
+	l.Exports, l.Imports = nil, nil
+	failed, why = ladderFails(t, func(tb testing.TB) { l.Run(tb) })
+	qt.Check(t, qt.IsTrue(failed), qt.Commentf("a live ladder that cannot read the owner's history ran"))
+	t.Logf("no history: %s", brief(why))
 }
 
 // brief is the first failure in one line, for the log.

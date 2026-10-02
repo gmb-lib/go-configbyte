@@ -55,7 +55,7 @@ func (o *owner) fetch(tenant string) configclient.Fetch {
 			return &configclient.Response{Status: 200, Header: http.Header{"Etag": {contract.ETag(o.versions[tenant])}},
 				Body: []byte(o.sections[tenant])}, nil
 		case contract.PathSection:
-			return &configclient.Response{Status: 200, Body: []byte(`{"section":"orders","schema":"orders-config/1","refersTo":[]}`)}, nil
+			return &configclient.Response{Status: 200, Body: []byte(`{"section":"orders","schema":"orders-config/1","refersTo":[],"audience":"svc:orders","scopeKeys":["orders"]}`)}, nil
 		}
 
 		return &configclient.Response{Status: 404}, nil
@@ -207,12 +207,16 @@ func TestTheSectionAnswerIsReadAndChecked(t *testing.T) {
 	o := newOwner()
 	a, err := configclient.Section(context.Background(), o.fetch(""))
 	qt.Assert(t, qt.IsNil(err))
-	qt.Check(t, qt.DeepEquals(a, contract.SectionAnswer{Section: "orders", Schema: "orders-config/1", RefersTo: []string{}}))
+	qt.Check(t, qt.DeepEquals(a, contract.SectionAnswer{Section: "orders", Schema: "orders-config/1", RefersTo: []string{},
+		Audience: "svc:orders", ScopeKeys: []string{"orders"}}))
 
 	for name, body := range map[string]string{
-		"not an answer":            `[]`,
-		"another section's schema": `{"section":"orders","schema":"stock-config/1","refersTo":[]}`,
-		"references not said":      `{"section":"orders","schema":"orders-config/1"}`,
+		"not an answer":             `[]`,
+		"another section's schema":  `{"section":"orders","schema":"stock-config/1","refersTo":[],"audience":"svc:orders","scopeKeys":["orders"]}`,
+		"references not said":       `{"section":"orders","schema":"orders-config/1","audience":"svc:orders","scopeKeys":["orders"]}`,
+		"no audience":               `{"section":"orders","schema":"orders-config/1","refersTo":[],"scopeKeys":["orders"]}`,
+		"no scope keys":             `{"section":"orders","schema":"orders-config/1","refersTo":[],"audience":"svc:orders"}`,
+		"an earlier owner's answer": `{"section":"orders","schema":"orders-config/1","refersTo":[]}`,
 	} {
 		wrong := func(context.Context, string) (*configclient.Response, error) {
 			return &configclient.Response{Status: 200, Body: []byte(body)}, nil

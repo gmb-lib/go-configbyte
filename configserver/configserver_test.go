@@ -26,11 +26,13 @@ import (
 // store stands in for an owner's own data: one section per tenant, and every
 // call recorded.
 type store struct {
-	mu      sync.Mutex
-	report  string
-	err     error
-	reads   int
-	applies []configserver.Apply
+	mu        sync.Mutex
+	report    string
+	err       error
+	exportErr error
+	reads     int
+	applies   []configserver.Apply
+	exports   []configserver.Export
 }
 
 func (s *store) ConfigRead(_ context.Context, tenant string) (configserver.Read, error) {
@@ -68,6 +70,24 @@ func (s *store) ConfigApply(_ context.Context, a configserver.Apply) (json.RawMe
 
 	return json.RawMessage(`{"schema":"orders-config/1","dryRun":` + boolText(a.DryRun) + `,"applied":` + boolText(!a.DryRun) +
 		`,"refused":false,"version":"sha256:` + a.Tenant + `"}`), nil
+}
+
+func (s *store) ConfigExported(_ context.Context, e configserver.Export) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exportErr != nil {
+		return s.exportErr
+	}
+	s.exports = append(s.exports, e)
+
+	return nil
+}
+
+func (s *store) exported() []configserver.Export {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]configserver.Export{}, s.exports...)
 }
 
 func boolText(b bool) string {
@@ -112,11 +132,13 @@ func serve(t *testing.T, edit func(o *configserver.Owner, s *served)) *served {
 
 	s.gate = set.Gate(func(_ *azugo.Context, required string) { s.refused = append(s.refused, required) })
 	o := &configserver.Owner{
-		Section: "orders",
-		Domain:  "orders",
-		Gate:    s.gate,
-		Read:    permissions.Levels("orders", "read"),
-		Write:   configserver.ImportRule(set, permissions.Levels("orders", "admin")),
+		Section:   "orders",
+		Audience:  "svc:orders",
+		ScopeKeys: []string{"orders"},
+		Domain:    "orders",
+		Gate:      s.gate,
+		Read:      permissions.Levels("orders", "read"),
+		Write:     configserver.ImportRule(set, permissions.Levels("orders", "admin")),
 		Tenant: func(ctx *azugo.Context) (string, bool) {
 			tenant := ctx.User().ClaimValue("tenant")
 			if tenant == "" {
@@ -164,7 +186,10 @@ func serve(t *testing.T, edit func(o *configserver.Owner, s *served)) *served {
 			next(ctx)
 		}
 	})
-	qt.Assert(t, qt.IsNil(o.Mount(v1)))
+	// The section answer is asked before the asker holds a token for this
+	// service, so it sits on the same root with no authentication in front.
+	open := a.Group("/api/v1")
+	qt.Assert(t, qt.IsNil(o.Mount(v1, open)))
 
 	a.Start(t)
 	t.Cleanup(a.Stop)
@@ -229,9 +254,10 @@ func (s *served) do(method, path string, c caller, body string, header ...string
 
 const doc = `{"schema":"orders-config/1"}`
 
-func TestEveryOperationFailsClosedWithoutAToken(t *testing.T) {
+// Every operation but the section answer fails closed without a token.
+func TestEveryOperationButTheSectionAnswerFailsClosedWithoutAToken(t *testing.T) {
 	s := serve(t, nil)
-	for _, path := range []string{contract.PathConfig, contract.PathVersion, contract.PathSection} {
+	for _, path := range []string{contract.PathConfig, contract.PathVersion} {
 		qt.Check(t, qt.Equals(s.do("GET", path, caller{}, "").status, 401), qt.Commentf("GET %s", path))
 	}
 	for _, path := range []string{contract.PathPreview, contract.PathApply} {
@@ -326,7 +352,7 @@ func TestAnApplyNamesTheVersionItWasPreviewedAgainst(t *testing.T) {
 	qt.Assert(t, qt.HasLen(calls, 3))
 	for _, a := range calls[:2] {
 		qt.Check(t, qt.DeepEquals(a, configserver.Apply{Tenant: "tenant-a", Actor: "actor:person-1",
-			Section: json.RawMessage(doc), DryRun: false, Expected: "sha256:abc"}))
+			Section: json.RawMessage(doc), DryRun: false, Expected: "sha256:abc", PartHash: contract.PartHash([]byte(doc))}))
 	}
 	qt.Check(t, qt.IsTrue(calls[2].DryRun))
 	qt.Check(t, qt.Equals(calls[2].Expected, ""))
@@ -402,21 +428,26 @@ func TestAStoreFailureIsRenderedByTheService(t *testing.T) {
 	qt.Check(t, qt.HasLen(rendered, 3))
 }
 
-// Which section answers here, and which sections it refers to, is answered to
-// any authenticated caller with no tenant: it says nothing about anybody's
-// configuration, and at deploy time there is no person to ask as.
-func TestTheSectionAnswerNeedsNoTenantAndNoPerson(t *testing.T) {
+// Which section answers here, which sections it refers to, and what a token for
+// this service carries are answered with no token at all: the answer says
+// nothing about anybody's configuration, and it is asked before the asker
+// holds any credential for this service.
+func TestTheSectionAnswerNeedsNoTokenNoTenantAndNoPerson(t *testing.T) {
 	s := serve(t, nil)
-	for _, c := range []caller{{scopes: "anything", sub: "svc:coordinator"}, {scopes: "anything"}} {
+	for _, c := range []caller{{}, {scopes: "anything", sub: "svc:coordinator"}, {scopes: "anything"}} {
 		got := s.do("GET", contract.PathSection, c, "")
 		qt.Check(t, qt.Equals(got.status, 200), qt.Commentf("%v: %s", c, got.body))
-		qt.Check(t, qt.Equals(got.body, `{"section":"orders","schema":"orders-config/1","refersTo":[]}`))
+		qt.Check(t, qt.Equals(got.body,
+			`{"section":"orders","schema":"orders-config/1","refersTo":[],"audience":"svc:orders","scopeKeys":["orders"]}`))
 	}
 	qt.Check(t, qt.Equals(s.store.reads, 0))
 
-	refers := serve(t, func(o *configserver.Owner, _ *served) { o.RefersTo = []string{"stock"} })
-	qt.Check(t, qt.Equals(refers.do("GET", contract.PathSection, caller{scopes: "x"}, "").body,
-		`{"section":"orders","schema":"orders-config/1","refersTo":["stock"]}`))
+	refers := serve(t, func(o *configserver.Owner, _ *served) {
+		o.RefersTo = []string{"stock"}
+		o.ScopeKeys = []string{"orders", "stock-keeping"}
+	})
+	qt.Check(t, qt.Equals(refers.do("GET", contract.PathSection, caller{}, "").body,
+		`{"section":"orders","schema":"orders-config/1","refersTo":["stock"],"audience":"svc:orders","scopeKeys":["orders","stock-keeping"]}`))
 }
 
 type routes struct{ paths []string }
@@ -424,27 +455,38 @@ type routes struct{ paths []string }
 func (r *routes) Get(path string, _ azugo.RequestHandler)  { r.paths = append(r.paths, "GET "+path) }
 func (r *routes) Post(path string, _ azugo.RequestHandler) { r.paths = append(r.paths, "POST "+path) }
 
-// The five, and nothing else, at the root they are given.
+// The five, and nothing else: four at the authenticated root, the section
+// answer at the open one.
 func TestMountRegistersTheFiveOperations(t *testing.T) {
-	r := &routes{}
-	o := &configserver.Owner{Section: "orders", Domain: "orders", Gate: set.Gate(nil),
+	r, open := &routes{}, &routes{}
+	o := &configserver.Owner{Section: "orders", Audience: "svc:orders", ScopeKeys: []string{"orders"}, Domain: "orders", Gate: set.Gate(nil),
 		Write:  configserver.ImportRule(set, permissions.Level{}),
 		Tenant: func(*azugo.Context) (string, bool) { return "", false }, Actor: func(*azugo.Context) string { return "" },
 		Store: func(*azugo.Context) (configserver.Store, bool) { return nil, false }}
-	qt.Assert(t, qt.IsNil(o.Mount(r)))
+	qt.Assert(t, qt.IsNil(o.Mount(r, open)))
 	qt.Check(t, qt.DeepEquals(r.paths, []string{
-		"GET /config", "GET /config/version", "POST /config/preview", "POST /config/apply", "GET /config/section",
+		"GET /config", "GET /config/version", "POST /config/preview", "POST /config/apply",
 	}))
+	qt.Check(t, qt.DeepEquals(open.paths, []string{"GET /config/section"}))
 }
 
 func TestMountRefusesAnOwnerItCannotServe(t *testing.T) {
 	good := func() *configserver.Owner {
-		return &configserver.Owner{Section: "orders", Domain: "orders", Gate: set.Gate(nil),
+		return &configserver.Owner{Section: "orders", Audience: "svc:orders", ScopeKeys: []string{"orders"}, Domain: "orders", Gate: set.Gate(nil),
 			Write:  configserver.ImportRule(set, permissions.Level{}),
 			Tenant: func(*azugo.Context) (string, bool) { return "", false }, Actor: func(*azugo.Context) string { return "" },
 			Store: func(*azugo.Context) (configserver.Store, bool) { return nil, false }}
 	}
-	qt.Assert(t, qt.IsNil(good().Mount(&routes{})))
+	qt.Assert(t, qt.IsNil(good().Mount(&routes{}, &routes{})))
+
+	// Both routers are needed: the section answer has nowhere to go without the
+	// open one, and nothing is mounted on the other either.
+	r := &routes{}
+	qt.Check(t, qt.IsNotNil(good().Mount(r, nil)))
+	qt.Check(t, qt.HasLen(r.paths, 0))
+	open := &routes{}
+	qt.Check(t, qt.IsNotNil(good().Mount(nil, open)))
+	qt.Check(t, qt.HasLen(open.paths, 0))
 
 	for name, edit := range map[string]func(o *configserver.Owner){
 		"a section name out of shape": func(o *configserver.Owner) { o.Section = "Orders" },
@@ -456,12 +498,16 @@ func TestMountRefusesAnOwnerItCannotServe(t *testing.T) {
 		"no tenant":                   func(o *configserver.Owner) { o.Tenant = nil },
 		"no actor":                    func(o *configserver.Owner) { o.Actor = nil },
 		"no store":                    func(o *configserver.Owner) { o.Store = nil },
+		"no audience":                 func(o *configserver.Owner) { o.Audience = "" },
+		"no scope keys":               func(o *configserver.Owner) { o.ScopeKeys = nil },
+		"a scope key that is a scope": func(o *configserver.Owner) { o.ScopeKeys = []string{"orders:read"} },
 	} {
 		o := good()
 		edit(o)
-		r := &routes{}
-		qt.Check(t, qt.IsNotNil(o.Mount(r)), qt.Commentf("%s", name))
+		r, open := &routes{}, &routes{}
+		qt.Check(t, qt.IsNotNil(o.Mount(r, open)), qt.Commentf("%s", name))
 		qt.Check(t, qt.HasLen(r.paths, 0), qt.Commentf("%s: nothing is mounted", name))
+		qt.Check(t, qt.HasLen(open.paths, 0), qt.Commentf("%s: nothing is mounted", name))
 	}
 }
 
@@ -470,11 +516,11 @@ func TestMountRefusesAnOwnerItCannotServe(t *testing.T) {
 // permission checked and nothing checked that is not declared.
 func TestTheImportPermissionIsContributedAndChecked(t *testing.T) {
 	gate := set.Gate(nil)
-	o := &configserver.Owner{Section: "orders", Domain: "orders", Gate: gate,
+	o := &configserver.Owner{Section: "orders", Audience: "svc:orders", ScopeKeys: []string{"orders"}, Domain: "orders", Gate: gate,
 		Write:  configserver.ImportRule(set, permissions.Levels("orders", "admin")),
 		Tenant: func(*azugo.Context) (string, bool) { return "", false }, Actor: func(*azugo.Context) string { return "" },
 		Store: func(*azugo.Context) (configserver.Store, bool) { return nil, false }}
-	qt.Assert(t, qt.IsNil(o.Mount(&routes{})))
+	qt.Assert(t, qt.IsNil(o.Mount(&routes{}, &routes{})))
 	gate.OneOf(permissions.Level{}, func(*azugo.Context) {}, set.Declared("order", "view"))
 	permissionstest.Check(t, set, gate)
 
@@ -501,4 +547,100 @@ func TestAServiceSaysHowItTellsAMachineFromAPerson(t *testing.T) {
 	qt.Check(t, qt.Equals(s.do("POST", contract.PathPreview, caller{scopes: "orders:admin", sub: "client:admin", tenant: "tenant-a"}, doc).status, 200))
 	qt.Check(t, qt.Equals(s.do("POST", contract.PathPreview, caller{scopes: "orders:admin", sub: "svc:admin", tenant: "tenant-a"}, doc).status, 403),
 		qt.Commentf("under this service's rule a svc: subject is a person, who never passes by a rung"))
+}
+
+const section = `{"schema":"orders-config/1","tenant":"tenant-a"}`
+
+// A read naming itself an export answers exactly what the read answers — the
+// section and its version as the ETag — and only once the owner has recorded
+// who took it out and the hash of the part they took. A plain read records
+// nothing.
+func TestAnExportReadAnswersTheReadOnceTheOwnerRecordedIt(t *testing.T) {
+	s := serve(t, nil)
+	plain := s.do("GET", contract.PathConfig, administrator, "")
+	qt.Assert(t, qt.Equals(plain.status, 200))
+	qt.Check(t, qt.HasLen(s.store.exported(), 0), qt.Commentf("a plain read records nothing"))
+
+	got := s.do("GET", contract.PathConfig, administrator, "", contract.HeaderPurpose, contract.PurposeExport)
+	qt.Assert(t, qt.Equals(got.status, 200), qt.Commentf("%s", got.body))
+	qt.Check(t, qt.Equals(got.body, plain.body))
+	qt.Check(t, qt.Equals(got.etag, plain.etag))
+	qt.Check(t, qt.DeepEquals(s.store.exported(), []configserver.Export{
+		{Tenant: "tenant-a", Actor: "actor:person-1", PartHash: contract.PartHash([]byte(section))},
+	}))
+	qt.Check(t, qt.Equals(contract.PartHash([]byte(got.body)), s.store.exported()[0].PartHash),
+		qt.Commentf("the recorded hash is the hash of the part the reader received"))
+
+	// The version read is never an export, whatever it is sent with.
+	qt.Check(t, qt.Equals(s.do("GET", contract.PathVersion, administrator, "", contract.HeaderPurpose, contract.PurposeExport).status, 200))
+	qt.Check(t, qt.HasLen(s.store.exported(), 1))
+}
+
+// Only a caller who may apply the section may take it out as an export: anyone
+// else is refused before the store is asked, so no export goes unrecorded and
+// nobody can write a history line by reading.
+func TestOnlyACallerWhoMayApplyMayExport(t *testing.T) {
+	s := serve(t, nil)
+	for _, c := range []caller{administrator, machineAdmin, machineImport} {
+		qt.Check(t, qt.Equals(s.do("GET", contract.PathConfig, c, "", contract.HeaderPurpose, contract.PurposeExport).status, 200),
+			qt.Commentf("%v", c))
+	}
+	reads, exports := s.store.reads, len(s.store.exported())
+	for _, c := range []caller{member, personNoBoxes, personLevels, machineRead, machineWrite, machineOther} {
+		got := s.do("GET", contract.PathConfig, c, "", contract.HeaderPurpose, contract.PurposeExport)
+		qt.Check(t, qt.Equals(got.status, 403), qt.Commentf("%v: %s", c, got.body))
+	}
+	qt.Check(t, qt.Equals(len(s.store.exported()), exports))
+	qt.Check(t, qt.Equals(s.store.reads, reads), qt.Commentf("a refused export never reaches the store"))
+	qt.Check(t, qt.Equals(s.do("GET", contract.PathConfig, caller{}, "", contract.HeaderPurpose, contract.PurposeExport).status, 401))
+}
+
+// An export whose record could not be written is not made: the failure is the
+// store's, rendered by the service, and the section never leaves.
+func TestAnExportThatCouldNotBeRecordedIsNotMade(t *testing.T) {
+	s := serve(t, nil)
+	s.store.exportErr = errors.New("the history could not be written")
+	got := s.do("GET", contract.PathConfig, administrator, "", contract.HeaderPurpose, contract.PurposeExport)
+	qt.Check(t, qt.Equals(got.status, 500), qt.Commentf("%s", got.body))
+	qt.Check(t, qt.Not(qt.StringContains(got.body, "orders-config/1")), qt.Commentf("the section did not leave"))
+	qt.Check(t, qt.Equals(got.etag, ""))
+}
+
+// A read naming a purpose this service does not know is refused, and the store
+// is never asked: a purpose misspelled must not quietly become a plain read
+// that leaves no record.
+func TestAReadNamingAnUnknownPurposeIsRefused(t *testing.T) {
+	s := serve(t, nil)
+	for _, purpose := range []string{"Export", "backup", "export;now"} {
+		got := s.do("GET", contract.PathConfig, administrator, "", contract.HeaderPurpose, purpose)
+		qt.Check(t, qt.Equals(got.status, 400), qt.Commentf("%q: %s", purpose, got.body))
+		qt.Check(t, qt.StringContains(got.body, "err:request:invalid"))
+	}
+	qt.Check(t, qt.Equals(s.store.reads, 0))
+	qt.Check(t, qt.HasLen(s.store.exported(), 0))
+}
+
+// An apply hands the owner the hash of the part as it arrived and the document
+// it arrived in, so the owner's line for the import names the file; a document
+// hash out of shape is refused before the store is asked.
+func TestAnApplyHandsTheOwnerThePartAndTheDocumentItCameIn(t *testing.T) {
+	s := serve(t, nil)
+	file := "sha256:" + strings.Repeat("0f", 32)
+	got := s.do("POST", contract.PathApply, administrator, doc, "If-Match", `"v"`, contract.HeaderDocument, file)
+	qt.Assert(t, qt.Equals(got.status, 200), qt.Commentf("%s", got.body))
+	got = s.do("POST", contract.PathPreview, administrator, doc, contract.HeaderDocument, file)
+	qt.Assert(t, qt.Equals(got.status, 200), qt.Commentf("%s", got.body))
+	calls := s.store.applied()
+	qt.Assert(t, qt.HasLen(calls, 2))
+	for _, a := range calls {
+		qt.Check(t, qt.Equals(a.PartHash, contract.PartHash([]byte(doc))))
+		qt.Check(t, qt.Equals(a.Document, file))
+	}
+
+	for _, bad := range []string{"sha256:short", "md5:" + strings.Repeat("0f", 16), "file.json"} {
+		got := s.do("POST", contract.PathApply, administrator, doc, "If-Match", `"v"`, contract.HeaderDocument, bad)
+		qt.Check(t, qt.Equals(got.status, 422), qt.Commentf("%q: %s", bad, got.body))
+		qt.Check(t, qt.StringContains(got.body, `"code":"err:orders:config_bad_document"`))
+	}
+	qt.Check(t, qt.HasLen(s.store.applied(), 2), qt.Commentf("refused before the store"))
 }

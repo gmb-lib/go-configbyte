@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-quicktest/qt"
 
+	"github.com/gmb-lib/go-configbyte/contract"
 	"github.com/gmb-lib/go-configbyte/document"
 )
 
@@ -38,6 +39,36 @@ func TestTheContentHashIsOverTheCanonicalSections(t *testing.T) {
 
 	edited := map[string]json.RawMessage{"orders": json.RawMessage(strings.Replace(string(sections["orders"]), "High", "Urgent", 1)), "stock": sections["stock"]}
 	qt.Check(t, qt.Not(qt.Equals(document.ContentHash(edited), document.ContentHash(sections))))
+}
+
+// Each section sits inside the content hash in the form its part hash is taken
+// over, so the hashes the owners record and the document's own are made of the
+// same bytes: a section holding characters an encoder escapes hashes alike on
+// both sides.
+func TestTheContentHashIsMadeOfThePartsAsTheirOwnersHashThem(t *testing.T) {
+	escaped := map[string]json.RawMessage{
+		"orders": json.RawMessage(`{"schema": "orders-config/1", "label": "R&D <north>"}`),
+		"stock":  json.RawMessage(`{"schema":"stock-config/1","kinds":[]}`),
+	}
+	var canonical bytes.Buffer
+	canonical.WriteString(`{"orders":`)
+	part, err := json.Marshal(escaped["orders"])
+	qt.Assert(t, qt.IsNil(err))
+	canonical.Write(part)
+	canonical.WriteString(`,"stock":`)
+	part, err = json.Marshal(escaped["stock"])
+	qt.Assert(t, qt.IsNil(err))
+	canonical.Write(part)
+	canonical.WriteString(`}`)
+	sum := sha256.Sum256(canonical.Bytes())
+	qt.Check(t, qt.Equals(document.ContentHash(escaped), "sha256:"+hex.EncodeToString(sum[:])))
+
+	for name, raw := range escaped {
+		inside, err := json.Marshal(raw)
+		qt.Assert(t, qt.IsNil(err))
+		one := sha256.Sum256(inside)
+		qt.Check(t, qt.Equals(contract.PartHash(raw), "sha256:"+hex.EncodeToString(one[:])), qt.Commentf("%s", name))
+	}
 }
 
 func TestAnExportIsTheCurrentFormatTheTenantAndTheHash(t *testing.T) {

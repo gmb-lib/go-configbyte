@@ -86,33 +86,75 @@ func FuzzEntityTagReadsBackEveryETag(f *testing.F) {
 	})
 }
 
-func TestTheSectionAnswerNamesTheSectionItsSchemaAndItsReferences(t *testing.T) {
-	a, err := NewSectionAnswer("orders", "stock")
+func TestTheSectionAnswerNamesTheSectionItsSchemaItsReferencesAndItsTokens(t *testing.T) {
+	a, err := NewSectionAnswer("orders", "svc:orders", []string{"orders", "stock-keeping"}, []string{"stock"})
 	qt.Assert(t, qt.IsNil(err))
 	raw, err := json.Marshal(a)
 	qt.Assert(t, qt.IsNil(err))
-	qt.Check(t, qt.Equals(string(raw), `{"section":"orders","schema":"orders-config/1","refersTo":["stock"]}`))
+	qt.Check(t, qt.Equals(string(raw),
+		`{"section":"orders","schema":"orders-config/1","refersTo":["stock"],"audience":"svc:orders","scopeKeys":["orders","stock-keeping"]}`))
 
-	none, err := NewSectionAnswer("orders")
+	none, err := NewSectionAnswer("orders", "svc:orders", []string{"orders"}, nil)
 	qt.Assert(t, qt.IsNil(err))
 	raw, _ = json.Marshal(none)
-	qt.Check(t, qt.Equals(string(raw), `{"section":"orders","schema":"orders-config/1","refersTo":[]}`),
+	qt.Check(t, qt.Equals(string(raw), `{"section":"orders","schema":"orders-config/1","refersTo":[],"audience":"svc:orders","scopeKeys":["orders"]}`),
 		qt.Commentf("no references is an empty list, never absent"))
 }
 
 func TestAnAnswerThatIsNotAConfigurationOwnersFailsItsCheck(t *testing.T) {
-	for name, a := range map[string]SectionAnswer{
-		"a name out of shape":        {Section: "Orders", Schema: "Orders-config/1", RefersTo: []string{}},
-		"another section's schema":   {Section: "orders", Schema: "stock-config/1", RefersTo: []string{}},
-		"references not said":        {Section: "orders", Schema: "orders-config/1"},
-		"a reference out of shape":   {Section: "orders", Schema: "orders-config/1", RefersTo: []string{"Stock"}},
-		"a reference to itself":      {Section: "orders", Schema: "orders-config/1", RefersTo: []string{"orders"}},
-		"a reference named twice":    {Section: "orders", Schema: "orders-config/1", RefersTo: []string{"stock", "stock"}},
-		"the schema of a later form": {Section: "orders", Schema: "orders-config/2", RefersTo: []string{}},
+	good := func() SectionAnswer {
+		return SectionAnswer{Section: "orders", Schema: "orders-config/1", RefersTo: []string{"stock"},
+			Audience: "svc:orders", ScopeKeys: []string{"orders"}}
+	}
+	for name, edit := range map[string]func(a *SectionAnswer){
+		"a name out of shape":        func(a *SectionAnswer) { a.Section, a.Schema = "Orders", "Orders-config/1" },
+		"another section's schema":   func(a *SectionAnswer) { a.Schema = "stock-config/1" },
+		"references not said":        func(a *SectionAnswer) { a.RefersTo = nil },
+		"a reference out of shape":   func(a *SectionAnswer) { a.RefersTo = []string{"Stock"} },
+		"a reference to itself":      func(a *SectionAnswer) { a.RefersTo = []string{"orders"} },
+		"a reference named twice":    func(a *SectionAnswer) { a.RefersTo = []string{"stock", "stock"} },
+		"the schema of a later form": func(a *SectionAnswer) { a.Schema = "orders-config/2" },
+		"no audience":                func(a *SectionAnswer) { a.Audience = "" },
+		"an audience with a space":   func(a *SectionAnswer) { a.Audience = "svc:orders svc:stock" },
+		"an audience out of bounds":  func(a *SectionAnswer) { a.Audience = "svc:" + strings.Repeat("o", 300) },
+		"no scope keys":              func(a *SectionAnswer) { a.ScopeKeys = nil },
+		"an empty list of keys":      func(a *SectionAnswer) { a.ScopeKeys = []string{} },
+		"a scope key out of shape":   func(a *SectionAnswer) { a.ScopeKeys = []string{"orders:read"} },
+		"a scope key named twice":    func(a *SectionAnswer) { a.ScopeKeys = []string{"orders", "orders"} },
 	} {
+		a := good()
+		edit(&a)
 		qt.Check(t, qt.IsNotNil(a.Check()), qt.Commentf("%s", name))
 	}
-	qt.Check(t, qt.IsNil(SectionAnswer{Section: "orders", Schema: "orders-config/1", RefersTo: []string{"stock"}}.Check()))
+	qt.Check(t, qt.IsNil(good().Check()))
+}
+
+// A part's hash is the same whether it is taken from the bytes the owner holds
+// or from a file the part travelled in, re-indented on the way and with its
+// characters escaped as an encoder escapes them — and it is the form the part
+// takes inside a document's content hash.
+func TestAPartHashesTheSameAsItTravelsAndAsAFileHoldsIt(t *testing.T) {
+	held := []byte(`{"schema":"orders-config/1","label":"R&D <north>","list":[1,2]}`)
+	file := []byte("{\n  \"schema\": \"orders-config/1\",\n  \"label\": \"R\\u0026D \\u003cnorth\\u003e\",\n  \"list\": [\n    1,\n    2\n  ]\n}")
+
+	h := PartHash(held)
+	qt.Check(t, qt.IsTrue(ValidHash(h)), qt.Commentf("%s", h))
+	qt.Check(t, qt.Equals(PartHash(file), h))
+
+	travelled, err := json.Marshal(json.RawMessage(held))
+	qt.Assert(t, qt.IsNil(err))
+	sum := sha256.Sum256(travelled)
+	qt.Check(t, qt.Equals(h, "sha256:"+hex.EncodeToString(sum[:])), qt.Commentf("the hash is over the part as it travels"))
+
+	qt.Check(t, qt.Not(qt.Equals(PartHash([]byte(`{"schema":"orders-config/1","label":"R&D"}`)), h)))
+}
+
+func TestOnlyASha256HashHasTheShapeOfOne(t *testing.T) {
+	qt.Check(t, qt.IsTrue(ValidHash("sha256:"+strings.Repeat("a0", 32))))
+	for _, s := range []string{"", "sha256:", "sha256:" + strings.Repeat("A0", 32), "sha1:" + strings.Repeat("a", 40),
+		"sha256:" + strings.Repeat("a", 63), "sha256:" + strings.Repeat("a", 65), " sha256:" + strings.Repeat("a0", 32)} {
+		qt.Check(t, qt.IsFalse(ValidHash(s)), qt.Commentf("%q", s))
+	}
 }
 
 // Every reason the contract refuses with renders with its status, keeps the
