@@ -22,6 +22,11 @@ const (
 	// Refused is an item the owner will not take. The item names the reason and
 	// says why. A document with one refused item writes nothing.
 	Refused Status = "refused"
+	// Skipped is an item the owner does not take from any document, by design —
+	// something a document may carry that only the owner's own acts change. The
+	// item names the reason and says why. Unlike a refusal, it holds nothing else
+	// in the document back.
+	Skipped Status = "skipped"
 )
 
 // Item is one line of a report: one item of the document, by key.
