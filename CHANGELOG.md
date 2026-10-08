@@ -4,6 +4,20 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.3.0
+
+### Added
+
+- **`contract.Skipped`, a fifth item status**: an item the owner does not take from any document, by design —
+  something a document may carry that only the owner's own acts change (a list the deployment keeps, say). The
+  item names its reason and says why; unlike `refused`, it holds nothing else in the document back. `Count`
+  leaves it out of the four counts it keeps.
+
+  ```json
+  {"key": "reports/report:export", "status": "skipped", "reason": "config_deployment_owned",
+   "detail": "not on this deployment's list; only whoever runs the deployment adds to it"}
+  ```
+
 ## v0.2.0
 
 Every owner now records each transport of its own section in its own history, and the section answer is asked with
