@@ -37,7 +37,8 @@ And the rules behind them:
   tenant. A token computed from the data cannot disagree with the data, whoever wrote it and however. It is
   opaque — compared for equality, never ordered.
 - **A preview writes nothing**, and reports what an apply of the same document would do: each item `added`,
-  `changed` (naming the members), `unchanged` or `refused` (naming the reason and saying why), by key.
+  `changed` (naming the members), `unchanged`, `refused` (naming the reason and saying why) or `skipped` (an item
+  the owner never takes from any document, naming the reason and saying why; it holds nothing else back), by key.
 - **An apply names the version its preview was read against.** None named: `428`. Moved since: `412`. Nothing is
   written in either case.
 - **One refused item and nothing is written.** A changed kind, type, unit or format on an existing key is refused
