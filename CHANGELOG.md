@@ -4,6 +4,39 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.3.1
+
+A security and dependency release with two things to act on: **this library now needs Go 1.27.2**, and it
+**requires azugo v0.40.0, go-platform-kit v1.11.4 and go-authbyte v0.29.1**, which your service inherits when it
+takes this version. Nothing this library does behaves differently.
+
+### Changed
+
+- **The module declares `go 1.27.2`** (was `1.27.0`). Go 1.27.2 and `golang.org/x/net` v0.60.0 fix
+  vulnerabilities that this library's code reaches under 1.27.0: `govulncheck` found seven it calls,
+  GO-2026-6603, -6607, -6608, -6611, -6612, -6613 and -6617, in `net/http`, `crypto/tls`, `net/textproto` and
+  `golang.org/x/net`, and none after the move. Raise your own module's `go` directive to `1.27.2`; from there the
+  go command downloads and uses that toolchain by itself.
+
+- **`azugo.io/azugo` and `azugo.io/core` → v0.40.0** (were v0.39.4 and v0.39.3), with **`go-platform-kit` →
+  v1.11.4** and **`go-authbyte` → v0.29.1** (was v0.27.0; the releases between add permission planes this library
+  does not use). None of azugo v0.40.0's changes reaches this library's code: it makes no calls through azugo's
+  HTTP client, sets no cookies, issues no redirects and implements no azugo cache, and it encodes and decodes its
+  documents with the standard `encoding/json`, so azugo's move to a newer JSON library touches only the bodies
+  azugo itself writes.
+
+### Notes
+
+- **Also moved:** `fasthttp` → **v1.75.0**, `golang.org/x/net` → **v0.61.0**, and indirect modules with them,
+  OpenTelemetry → v1.47.0 among them.
+
+- **CI's linter moved to golangci-lint v2.14.0** (was v2.13.1). The earlier release cannot read Go 1.27.2's
+  compiled standard library and stops before linting anything. No code changed with it.
+
+- The gate is green on Go 1.27.2: `go mod verify`, `go mod tidy -diff`, build, vet, `gofmt`, golangci-lint
+  v2.14.0, `go test -race` with **0 races**, and both fuzz targets for 30 seconds each with no failing input;
+  `govulncheck` reports nothing this library calls.
+
 ## v0.3.0
 
 ### Added
