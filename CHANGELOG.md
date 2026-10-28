@@ -4,6 +4,16 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.3.2
+
+This release requires **Go 1.27.3** (was 1.27.2). Raise your own module's `go` directive before upgrading.
+No library source or public API changed.
+
+### Changed
+
+- `azugo.io/azugo` → v0.40.2, `azugo.io/core` → v0.40.1, `go-authbyte` → v0.31.2,
+  `go-platform-kit` → v1.11.5, and `fasthttp` → v1.77.0. Their transitive dependencies were refreshed.
+
 ## v0.3.1
 
 A security and dependency release with two things to act on: **this library now needs Go 1.27.2**, and it
