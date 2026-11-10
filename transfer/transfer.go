@@ -78,6 +78,21 @@ type Transfer struct {
 	// Warn is told of a call that produced no owner's answer and of an import
 	// that had to restore what it wrote. Nil tells nobody.
 	Warn func(msg string)
+	// AfterRequest bounds each call made after the request may have ended — a
+	// restore, a read-back — which no longer runs under the request's deadline.
+	// Zero means 30 seconds.
+	AfterRequest time.Duration
+}
+
+// detached is the context for one call that must finish even when the request
+// has ended, bounded by the transfer's own limit instead of the request's.
+func (t *Transfer) detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	limit := t.AfterRequest
+	if limit <= 0 {
+		limit = 30 * time.Second
+	}
+
+	return context.WithTimeout(context.WithoutCancel(ctx), limit)
 }
 
 // File is an exported document, ready to answer as a download.
@@ -402,7 +417,7 @@ func (t *Transfer) applyDocument(ctx context.Context, p Person, c Caller, owned 
 
 	// Write, in order, each under the version it was previewed at.
 	for i, s := range owned {
-		res := t.applySection(ctx, c, s, s.raw, expect[s.owner.Section], documentHash)
+		res, answered := t.applySection(ctx, c, s, s.raw, expect[s.owner.Section], documentHash)
 		results[s.owner.Section] = res
 		if res.Status == document.SectionApplied {
 			continue
@@ -413,10 +428,52 @@ func (t *Transfer) applyDocument(ctx context.Context, p Person, c Caller, owned 
 			results[later.owner.Section] = withheld
 		}
 
-		return t.restore(ctx, p, c, owned[:i], documentHash, results), nil
+		// A write without a clear answer may have landed all the same.
+		unsure := !answered && t.mayHaveLanded(ctx, p, c, s, expect[s.owner.Section], results)
+
+		outcome := t.restore(ctx, c, owned[:i], documentHash, results)
+		if unsure {
+			outcome = document.Partial
+		}
+		if i > 0 {
+			t.warn("configuration import compensated after a failed section (tenant " + p.Tenant + ", " + string(outcome) + ")")
+		}
+
+		return outcome, nil
 	}
 
 	return document.Applied, nil
+}
+
+// mayHaveLanded reads back a section whose write had no clear answer — no
+// answer at all, a server error, or an answer that could not be read: a timeout
+// after the owner had already written it, say. When its version is still the
+// one the apply named, the write has not landed and nothing more is needed;
+// a write still held up somewhere could land later, which only the owner
+// could rule out. Otherwise the section may hold this document's version: it
+// moved (and a move cannot be told from someone else's change made in between,
+// so it is never written back over), or it cannot be read at all. Its line
+// says so, and the import is partial rather than rolled back.
+func (t *Transfer) mayHaveLanded(ctx context.Context, p Person, c Caller, s *ownedSection, version string, results map[string]document.SectionResult) bool {
+	ctx, cancel := t.detached(ctx)
+	defer cancel()
+	res := results[s.owner.Section]
+
+	const check = " Preview the document again: a section with nothing left to change already holds it."
+	resp, err := call(ctx, c, s.owner, s.scope, http.MethodGet, contract.PathConfig, nil, nil)
+	switch {
+	case err == nil && resp.Status < http.StatusBadRequest && strings.Trim(resp.Header.Get("ETag"), `"`) == version:
+		return false
+	case err == nil && resp.Status < http.StatusBadRequest:
+		res.Version = strings.Trim(resp.Header.Get("ETag"), `"`)
+		res.Detail = "its write had no clear answer, and it changed after the preview: it may hold this document's version, and was not written back over." + check
+	default:
+		res.Detail = "its write had no clear answer, and it could not be read back: it may hold this document's version." + check
+	}
+	results[s.owner.Section] = res
+	t.warn("configuration import: the " + s.owner.Section + " section's write had no clear answer and it may hold the document (tenant " + p.Tenant + ")")
+
+	return true
 }
 
 // restore writes back what each already-written section held before the apply,
@@ -428,37 +485,42 @@ func (t *Transfer) applyDocument(ctx context.Context, p Person, c Caller, owned 
 //
 // The restore runs even when the request's context has ended — the person
 // gone, or its deadline passed — because sections already written must not be
-// left half applied; each call is still bounded by the host's own client.
-func (t *Transfer) restore(ctx context.Context, p Person, c Caller, written []*ownedSection, documentHash string, results map[string]document.SectionResult) document.Outcome {
+// left half applied; each call is bounded by AfterRequest instead.
+func (t *Transfer) restore(ctx context.Context, c Caller, written []*ownedSection, documentHash string, results map[string]document.SectionResult) document.Outcome {
 	if len(written) == 0 {
 		return document.Failed
 	}
-	ctx = context.WithoutCancel(ctx)
 
 	outcome := document.RolledBack
 	for i := len(written) - 1; i >= 0; i-- {
 		s := written[i]
 		res := results[s.owner.Section]
-		back := t.applySection(ctx, c, s, s.held, res.Version, documentHash)
-		if back.Status == document.SectionApplied {
+		cctx, cancel := t.detached(ctx)
+		back, answered := t.applySection(cctx, c, s, s.held, res.Version, documentHash)
+		cancel()
+		switch {
+		case back.Status == document.SectionApplied:
 			res.Status = document.SectionRolledBack
 			res.Version = back.Version
 			res.Detail = "applied, then restored to what it held before this import because a later section failed"
-		} else {
+		case answered:
 			outcome = document.Partial
-			res.Detail = "applied, and could not be restored after a later section failed — this section holds the document's version"
+			res.Detail = "applied, and could not be restored after a later section failed — this section holds the document's version, or a change made since"
+			res.Problem = back.Problem
+		default:
+			outcome = document.Partial
+			res.Detail = "applied, and could not be restored after a later section failed: its restore had no clear answer, so it may hold the document's version or what it held before"
 			res.Problem = back.Problem
 		}
 		results[s.owner.Section] = res
 	}
-	t.warn("configuration import compensated after a failed section (tenant " + p.Tenant + ", " + string(outcome) + ")")
 
 	return outcome
 }
 
 // previewSection asks one owner what its section would do. A refusal inside
 // the document is a 200 with the report saying `refused: true`; a refused or
-// failed call keeps the owner's problem verbatim.
+// failed call keeps the public part of the owner's problem.
 func (t *Transfer) previewSection(ctx context.Context, c Caller, s *ownedSection) document.SectionResult {
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
@@ -469,7 +531,7 @@ func (t *Transfer) previewSection(ctx context.Context, c Caller, s *ownedSection
 		return document.SectionResult{Status: document.SectionFailed, Problem: unavailable()}
 	}
 	if resp.Status >= http.StatusBadRequest {
-		return document.SectionResult{Status: document.SectionFailed, Problem: json.RawMessage(resp.Body)}
+		return document.SectionResult{Status: document.SectionFailed, Problem: publicProblem(resp.Status, resp.Body)}
 	}
 
 	var rep contract.Outcome
@@ -486,8 +548,12 @@ func (t *Transfer) previewSection(ctx context.Context, c Caller, s *ownedSection
 // document it came in so the owner's record of the apply names the file. An
 // owner that declines the document answers a 200 with `applied: false`; one
 // whose configuration moved past the version answers 412 — both are a section
-// that did not land, which the caller answers for the whole document.
-func (t *Transfer) applySection(ctx context.Context, c Caller, s *ownedSection, body json.RawMessage, version, documentHash string) document.SectionResult {
+// that did not land, which the caller answers for the whole document. It also
+// answers whether the answer is clear: an owner's decision (a 2xx it could be
+// read from, a 4xx), or the token authority refusing a call never sent. No
+// answer, a server error or a 2xx that cannot be read is not clear: such a
+// write may have landed.
+func (t *Transfer) applySection(ctx context.Context, c Caller, s *ownedSection, body json.RawMessage, version, documentHash string) (document.SectionResult, bool) {
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
 	header.Set("If-Match", contract.ETag(version))
@@ -495,21 +561,25 @@ func (t *Transfer) applySection(ctx context.Context, c Caller, s *ownedSection, 
 	resp, err := call(ctx, c, s.owner, s.scope, http.MethodPost, contract.PathApply, header, body)
 	if err != nil {
 		t.warn("configuration import: section apply failed: " + err.Error())
+		_, refusedByAuthority := authorityRefusal(err)
 
-		return document.SectionResult{Status: document.SectionFailed, Problem: unavailable()}
+		return document.SectionResult{Status: document.SectionFailed, Problem: unavailable()}, refusedByAuthority
 	}
 	if resp.Status >= http.StatusBadRequest {
-		return document.SectionResult{Status: document.SectionFailed, Problem: json.RawMessage(resp.Body)}
+		return document.SectionResult{Status: document.SectionFailed, Problem: publicProblem(resp.Status, resp.Body)},
+			resp.Status < http.StatusInternalServerError
 	}
 
 	var rep contract.Outcome
-	_ = json.Unmarshal(resp.Body, &rep)
+	if err := json.Unmarshal(resp.Body, &rep); err != nil {
+		return document.SectionResult{Status: document.SectionFailed, Problem: unavailable()}, false
+	}
 	status := document.SectionApplied
 	if !rep.Applied {
 		status = document.SectionRefused
 	}
 
-	return document.SectionResult{Status: status, Version: rep.Version, Report: json.RawMessage(resp.Body)}
+	return document.SectionResult{Status: status, Version: rep.Version, Report: json.RawMessage(resp.Body)}, true
 }
 
 var (

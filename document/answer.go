@@ -14,13 +14,16 @@ const (
 	// clean sections are reported withheld.
 	Refused Outcome = "refused"
 	// RolledBack is a document whose later section failed after earlier ones
-	// were written; each written section was restored to what it held before.
+	// were written; each written section was restored to what it held before,
+	// and the failed one read back unchanged.
 	RolledBack Outcome = "rolledBack"
-	// Partial is a document a restore could not complete: each section's state
-	// is named.
+	// Partial is a document that may have landed in part: a restore could not
+	// complete, or a section whose write had no clear answer changed or could
+	// not be read back. Each section's line says what it may hold.
 	Partial Outcome = "partial"
 	// Failed is a document an owner could not be asked about, or whose first
-	// write failed: nothing was written.
+	// write failed and read back unchanged: nothing was written that the owners
+	// have shown.
 	Failed Outcome = "failed"
 )
 
@@ -56,10 +59,12 @@ type SectionResult struct {
 	Version string `json:"version,omitempty"`
 	// Report is the owner's report, verbatim, when it answered one.
 	Report json.RawMessage `json:"report,omitempty"`
-	// Problem is the owner's refusal, verbatim, when the call itself was
-	// refused or failed.
+	// Problem is the public part of the owner's refusal or failure (its code,
+	// status, title, type and trace id) when the call itself was refused or
+	// failed.
 	Problem json.RawMessage `json:"problem,omitempty"`
-	// Detail says why a section was skipped, or what a restore did to it.
+	// Detail says why a section was skipped, what a restore did to it, or what
+	// it may hold when a write had no clear answer.
 	Detail string `json:"detail,omitempty"`
 }
 

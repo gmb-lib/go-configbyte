@@ -4,6 +4,38 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.4.1
+
+Two fixes in `transfer`. Code that uses it compiles and runs unchanged, but both change what an import answers in
+the cases below, and `partial` now also means "may have landed in part" where it meant "a restore failed".
+
+### Fixed
+
+- **A section's line carries only the public part of an owner's refusal or failure.** When an owner answered a
+  section's preview or apply with an error, the line in the import's answer held the owner's problem word for word:
+  the services it passed through and its internal detail, inside an answer of 200 that the host's own public
+  projection never reaches. The line now keeps only the code, status, title, type and trace id, with the status the
+  owner answered with and a title of at most 200 characters. A body that is no problem, or has no `err:` code,
+  keeps only its status (`err:upstream:refused` for a 4xx, `502 err:upstream:unavailable` otherwise).
+
+  ```json
+  "orders": {"status": "failed", "problem": {"title": "Internal", "status": 500, "code": "err:owner:internal"}}
+  ```
+
+- **An import whose write to a section had no clear answer is no longer reported rolled back while that section may
+  hold the document.** No answer at all, a server error (a proxy's timeout in front of the owner, say) or a 200 that
+  is no report: the section is read back. When its version is still the one the apply named, the import rolls back
+  as before; when it moved, or cannot be read, its line says so and the outcome is `partial`. A section that moved
+  is not written back over, since a move cannot be told from someone else's change made in between. An apply the
+  token authority refused was never sent and is not read back. A restore without a clear answer says the section
+  may hold either version. A read-back that finds the version unchanged cannot rule out a write still held up
+  somewhere that lands later; only the owner could.
+
+### Added
+
+- **`Transfer.AfterRequest`** bounds each call made after the request may have ended (a restore, a read-back),
+  which runs to the end even when the request has ended. Zero means 30 seconds.
+
 ## v0.4.0
 
 Two packages added; nothing that existed changed. Code that already uses this library needs no change.
