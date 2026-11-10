@@ -4,6 +4,32 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.4.0
+
+Two packages added; nothing that existed changed. Code that already uses this library needs no change.
+
+### Added
+
+- **`transfer`: a tenant's whole configuration carried as one document, for any service that hosts it** — an
+  administration service, or an application's own backend. `Export` reads every owner's section the person holds
+  anything of, as an export, and answers the file; one refusal or one owner that cannot be reached ends it.
+  `Import` previews a document (each section's version answered) or applies it whole or not at all: it stops when
+  a section moved after its preview, writes nothing when one is refused, writes in the owners' order, and restores
+  the sections already written, newest first, when a later one fails. The host brings a `Caller` that makes one
+  call to an owner on the person's behalf, and the person's tenant and scopes; the package never sees a session or
+  a token. `Problem` turns its errors into the problem answers every host gives alike: `403
+  err:request:forbidden` for someone who holds nothing any owner accepts, `422 err:config:badDocument`, `428
+  err:config:versionRequired`, `412 err:config:versionMoved`, an owner's own refusal relayed as it came, and `502
+  err:upstream:unavailable` when a call produced no answer.
+- **`owners`: a deployment's owners found from their addresses alone.** `Discover` asks each address for its
+  section answer, retrying while an owner starts, and `Arrange` works out the order an import writes the sections
+  in: a section after the sections it refers to, and the role register's last.
+
+### Changed
+
+- The module now lists five more indirect requirements, all of them go-authbyte's own, because `transfer` reads
+  the token authority's refusal through go-authbyte's client. No direct requirement was added.
+
 ## v0.3.2
 
 This release requires **Go 1.27.3** (was 1.27.2). Raise your own module's `go` directive before upgrading.

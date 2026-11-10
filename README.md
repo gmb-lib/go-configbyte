@@ -62,6 +62,8 @@ And the rules behind them:
 | [`configclient`](./configclient) | Reading another owner's section: the version, the section with its `ETag`, the section answer, and a cache that hands a copy out only against the version its owner just confirmed |
 | [`document`](./document) | The configuration document that carries every owner's section in one file: its types, its content hash, parsing an import, and the words an import answers with |
 | [`match`](./match) | Judging a document against what an owner holds, item by item and by key, for an owner whose apply is written in Go |
+| [`owners`](./owners) | Finding a deployment's owners from their addresses alone (each answers its section answer), and the order an import writes their sections in |
+| [`transfer`](./transfer) | Carrying a tenant's whole configuration as one document: the export over every owner, and the import's dry run and apply, whole or not at all, for any service that hosts it |
 | [`configtest`](./configtest) | The proof ladder: every promise above, checked against a service's own routes from its own tests |
 
 ## Owning a section
@@ -147,6 +149,37 @@ if errors.As(err, &refused) {
 otherwise reads the section and keeps it under the version stamped on those very bytes. Nothing expires by time.
 Whether a caller may be answered a section at all is decided before the cache is asked.
 
+## Carrying a whole configuration
+
+A service that offers an administrator the export and the import — an administration service, or an
+application's own backend — finds the deployment's owners once at start, and answers each request through
+`transfer`:
+
+```go
+set, err := owners.Discover(ctx, addresses, owners.HTTPProber(get), time.Minute, time.Second)
+
+t := &transfer.Transfer{Owners: set, Warn: logWarning}
+caller := transfer.CallerFunc(func(ctx context.Context, o *owners.Owner, scope, method, path string,
+	header http.Header, body []byte) (*configclient.Response, error) {
+	// one call to o.Address+path, on the person's behalf, asking for exactly scope
+})
+person := transfer.Person{Tenant: tenant, Scopes: scopesThePersonHolds}
+
+file, err := t.Export(ctx, person, caller, time.Now())                // file.Name, file.Body, file.Hash
+imported, err := t.Import(ctx, person, caller, requestBody, dryRun) // imported.Answer is the answer
+if err != nil {
+	return transfer.Problem(err, "my-service") // the same code, status and words from every host
+}
+```
+
+The export asks every owner the person holds anything of for its section, as an export, and fails whole when
+one refuses or cannot be reached. The dry run asks each owner to preview its section and answers each one's
+version. The apply names those versions: it stops when one moved, writes nothing when one section is refused,
+then writes the sections in the owners' order and, when a later one fails, restores the ones already written,
+newest first. A section no owner holds, or whose owner the person holds nothing of, is reported skipped. Every
+owner judges every call with the person's own scopes; the transfer adds no rule of its own, and never sees a
+session or a token.
+
 ## Proving it
 
 ```go
@@ -170,9 +203,10 @@ another tenant's section, and the record of every transport, which it reads thro
 
 ## Dependencies
 
-[Azugo](https://azugo.io) for routing, [go-authbyte](https://github.com/gmb-lib/go-authbyte) for permissions and
-the service-subject marker, [go-platform-kit](https://github.com/gmb-lib/go-platform-kit) for the error taxonomy
-the reasons are registered with. Tests use [quicktest](https://github.com/go-quicktest/qt).
+[Azugo](https://azugo.io) for routing, [go-authbyte](https://github.com/gmb-lib/go-authbyte) for permissions,
+the service-subject marker and, in `transfer`, telling the token authority's refusal from a failed call,
+[go-platform-kit](https://github.com/gmb-lib/go-platform-kit) for the error taxonomy the reasons are registered
+with and the problems `transfer` answers. Tests use [quicktest](https://github.com/go-quicktest/qt).
 
 ## Contributing
 
