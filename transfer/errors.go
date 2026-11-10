@@ -1,14 +1,20 @@
 package transfer
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gmb-lib/go-authbyte/authclient"
 	pkerrors "github.com/gmb-lib/go-platform-kit/errors"
 
 	"github.com/gmb-lib/go-configbyte/document"
 )
+
+// maxTitle is the most of an owner's title a section's line carries, in
+// characters: a title is a line, not a body.
+const maxTitle = 200
 
 // ErrNothingHeld refuses a transfer for someone who holds nothing any owner of
 // the deployment accepts, before any owner is called.
@@ -153,4 +159,33 @@ func relayed(service string, status int, body []byte) error {
 	}
 
 	return pkerrors.NewProblem("err:upstream:unavailable", pkerrors.WithStatus(http.StatusBadGateway))
+}
+
+// publicProblem is an owner's refusal or failure as a section's line carries
+// it: only the part of its problem meant for whoever reads the answer — its
+// code, status, title, type and trace id — never the services it passed
+// through, and never its detail, which is internal once decoded from another
+// service's answer. The line travels inside an answer of 200, past the host's
+// own projection of its errors, so it is projected here. Its status is the one
+// the owner answered with, and its title is kept to a line. A body that is no
+// problem, or carries no code of the fleet's shape, keeps only its status:
+// refused for a 4xx, unavailable otherwise.
+func publicProblem(status int, body []byte) json.RawMessage {
+	if p, ok := pkerrors.ParseProblem(body); ok {
+		if _, coded := pkerrors.ParseCode(p.Code); coded {
+			p.Status = status
+			pub := p.Public()
+			if r := []rune(pub.Title); len(r) > maxTitle {
+				pub.Title = string(r[:maxTitle])
+			}
+			if b, err := json.Marshal(pub); err == nil {
+				return b
+			}
+		}
+	}
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+		return json.RawMessage(`{"code":"err:upstream:refused","status":` + strconv.Itoa(status) + `}`)
+	}
+
+	return unavailable()
 }

@@ -63,13 +63,40 @@ type stub struct {
 	unreached error
 	// etag replaces the read's ETag header, quotes and all, when set.
 	etag string
-	// failApply fails the apply with this number (1 = the first), 0 for none;
-	// onFail, when set, runs as it fails.
-	failApply int
-	onFail    func()
-	applies   int
+	// failApply fails the apply with this number (1 = the first), 0 for none,
+	// answering failStatus (500 when unset) with failBody (a plain problem when
+	// unset); onFail, when set, runs as it fails.
+	failApply  int
+	failStatus int
+	failBody   string
+	onFail     func()
+	// loseApply writes the apply with this number and then loses its answer;
+	// dropApply loses the apply with this number before it writes anything.
+	// onLose, when set, runs as an answer is lost; unreadableAfterLoss makes
+	// every read after a lost answer produce no answer either.
+	loseApply, dropApply int
+	onLose               func()
+	unreadableAfterLoss  bool
+	lost                 bool
+	// gatewayAfterWrite writes the apply with this number and answers 504 with a
+	// proxy's page; garbleAfterWrite writes it and answers 200 with a body that
+	// is not a report; authorityRefuses refuses the apply with this number at
+	// the token authority, before anything is sent.
+	gatewayAfterWrite, garbleAfterWrite, authorityRefuses int
+	applies                                               int
 	// written is every section body an apply wrote, in order.
 	written []string
+}
+
+var errLost = errors.New("read tcp: i/o timeout")
+
+func (s *stub) loseAnswer() answer {
+	s.lost = true
+	if s.onLose != nil {
+		s.onLose()
+	}
+
+	return answer{err: errLost}
 }
 
 func (s *stub) answer(c call) answer {
@@ -83,6 +110,9 @@ func (s *stub) answer(c call) answer {
 	case s.unreached != nil:
 		return answer{err: s.unreached}
 	case c.method == http.MethodGet && c.path == "/config":
+		if s.lost && s.unreadableAfterLoss {
+			return answer{err: errLost}
+		}
 		if s.readRefused || (c.header.Get("Config-Purpose") == "export" && s.exportRefused) {
 			return forbidden
 		}
@@ -97,13 +127,26 @@ func (s *stub) answer(c call) answer {
 		return answer{status: http.StatusOK, body: fmt.Sprintf(`{"dryRun":true,"applied":false,"refused":%t,"version":%q}`, s.refuse, s.version)}
 	case c.method == http.MethodPost && c.path == "/config/apply":
 		s.applies++
+		if s.applies == s.authorityRefuses {
+			return answer{err: &authclient.Error{Status: http.StatusForbidden,
+				Body: `{"code":"err:auth:scope_not_granted","title":"Forbidden","status":403}`}}
+		}
+		if s.applies == s.dropApply {
+			return s.loseAnswer()
+		}
 		if s.applies == s.failApply {
 			if s.onFail != nil {
 				s.onFail()
 			}
+			status, body := s.failStatus, s.failBody
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			if body == "" {
+				body = `{"code":"err:owner:internal","title":"Internal","status":500}`
+			}
 
-			return answer{status: http.StatusInternalServerError, header: http.Header{"Content-Type": {"application/problem+json"}},
-				body: `{"code":"err:owner:internal","title":"Internal","status":500}`}
+			return answer{status: status, header: http.Header{"Content-Type": {"application/problem+json"}}, body: body}
 		}
 		if c.header.Get("If-Match") != `"`+s.version+`"` {
 			return answer{status: http.StatusPreconditionFailed, body: `{"code":"err:owner:config_version_moved","status":412}`}
@@ -111,6 +154,15 @@ func (s *stub) answer(c call) answer {
 		s.written = append(s.written, string(c.body))
 		s.section = string(c.body)
 		s.version += "+"
+		if s.applies == s.loseApply {
+			return s.loseAnswer()
+		}
+		if s.applies == s.gatewayAfterWrite {
+			return answer{status: http.StatusGatewayTimeout, body: "<html>504 Gateway Time-out</html>"}
+		}
+		if s.applies == s.garbleAfterWrite {
+			return answer{status: http.StatusOK, body: "<html>ok</html>"}
+		}
 
 		return answer{status: http.StatusOK, body: fmt.Sprintf(`{"dryRun":false,"applied":true,"refused":false,"version":%q}`, s.version)}
 	}
@@ -735,7 +787,7 @@ func TestEveryCallCarriesOnlyTheScopesUnderItsOwnersKeys(t *testing.T) {
 
 	keys := map[string][]string{"orders": {"orders"}, "stock": {"stock", "warehouse"}, "rolebyte": {"membership"}}
 	calls := d.recorded()
-	qt.Assert(t, qt.HasLen(calls, 14), qt.Commentf("3 export reads, 3 reads, 3 previews, 3 applies, 2 restores"))
+	qt.Assert(t, qt.HasLen(calls, 15), qt.Commentf("3 export reads, 3 reads, 3 previews, 3 applies, 1 read-back of the failed one, 2 restores"))
 	for _, c := range calls {
 		qt.Check(t, qt.IsFalse(c.nilHeader), qt.Commentf("%s %s to %s", c.method, c.path, c.section))
 		qt.Assert(t, qt.Not(qt.Equals(strings.TrimSpace(c.scope), "")))
@@ -798,4 +850,272 @@ func TestTheRestoreRunsAfterTheRequestEnded(t *testing.T) {
 	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.RolledBack))
 	qt.Check(t, qt.Equals(d.orders.section, ordersSection))
 	qt.Check(t, qt.DeepEquals(d.orders.written, []string{edited, ordersSection}))
+}
+
+// An owner's refusal or failure reaches the section's line only as its public
+// part — code, status, title, trace id — never the services it passed through
+// or its internal detail: the line travels inside an answer of 200, past the
+// host's own projection.
+func TestASectionsLineCarriesOnlyThePublicPartOfTheOwnersProblem(t *testing.T) {
+	d := newDeployment(t)
+	d.orders.failApply = 1
+	d.orders.failBody = `{"type":"about:blank","title":"Internal","status":500,"code":"err:owner:internal",` +
+		`"detail":"pq: relation \"cfg_orders\" does not exist","source":"orders","trace_id":"01TRACE",` +
+		`"chain":[{"service":"orders-db","code":"err:db:missing","status":500}]}`
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection}, map[string]string{"orders": "sha256:orders"}), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Failed))
+	qt.Check(t, qt.JSONEquals([]byte(imp.Answer.Sections["orders"].Problem), map[string]any{
+		"type": "about:blank", "title": "Internal", "status": 500, "code": "err:owner:internal", "trace_id": "01TRACE",
+	}))
+
+	// A preview's refusal alike.
+	d = newDeployment(t)
+	stockFails := `{"title":"Conflict","status":409,"code":"err:stock:busy","detail":"lock held by job 7","source":"stock"}`
+	call := transfer.CallerFunc(func(ctx context.Context, o *owners.Owner, scope, method, path string, header http.Header, body []byte) (*configclient.Response, error) {
+		if o.Section == "stock" && path == "/config/preview" {
+			return &configclient.Response{Status: http.StatusConflict, Header: http.Header{}, Body: []byte(stockFails)}, nil
+		}
+
+		return d.Call(ctx, o, scope, method, path, header, body)
+	})
+	imp, err = d.transfer().Import(context.Background(), everyone(), call, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection}, nil), true)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.JSONEquals([]byte(imp.Answer.Sections["stock"].Problem), map[string]any{
+		"title": "Conflict", "status": 409, "code": "err:stock:busy",
+	}))
+}
+
+// A refusal or failure whose body is no problem keeps only its status in the
+// section's line: refused for a 4xx, unavailable otherwise — never the body.
+func TestASectionsLineWithoutAProblemBodyKeepsOnlyItsStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   map[string]any
+	}{
+		{http.StatusConflict, map[string]any{"code": "err:upstream:refused", "status": 409}},
+		{http.StatusInternalServerError, map[string]any{"code": "err:upstream:unavailable", "status": 502}},
+	} {
+		d := newDeployment(t)
+		d.orders.failApply = 1
+		d.orders.failStatus = tc.status
+		d.orders.failBody = "<html>a proxy's page naming its host</html>"
+
+		imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+			map[string]string{"orders": ordersSection}, map[string]string{"orders": "sha256:orders"}), false)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Check(t, qt.JSONEquals([]byte(imp.Answer.Sections["orders"].Problem), tc.want), qt.Commentf("status %d", tc.status))
+	}
+}
+
+// A write whose answer was lost after the owner wrote it leaves its section
+// holding the document: the import is partial, never rolled back. The sections
+// before it are restored; that one is not written back over, because a move
+// cannot be told from someone else's change made in between. The read-back runs
+// even when the request ended with the lost answer.
+func TestAWriteWhoseAnswerWasLostAfterItLandedMakesTheImportPartial(t *testing.T) {
+	d := newDeployment(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.roles.loseApply = 1
+	d.roles.onLose = cancel
+	edited := `{"schema":"rolebyte-config/1","roles":[]}`
+
+	imp, err := d.transfer().Import(ctx, everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection, "rolebyte": edited}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+
+	a := imp.Answer
+	qt.Check(t, qt.Equals(a.Outcome, document.Partial))
+	qt.Check(t, qt.Equals(a.Sections["orders"].Status, document.SectionRolledBack))
+	qt.Check(t, qt.Equals(a.Sections["stock"].Status, document.SectionRolledBack))
+	qt.Check(t, qt.Equals(a.Sections["rolebyte"].Status, document.SectionFailed))
+	qt.Check(t, qt.Equals(a.Sections["rolebyte"].Version, "sha256:roles+"))
+	qt.Check(t, qt.IsTrue(strings.Contains(a.Sections["rolebyte"].Detail, "changed after the preview")), qt.Commentf("%s", a.Sections["rolebyte"].Detail))
+	qt.Check(t, qt.DeepEquals(d.roles.written, []string{edited}), qt.Commentf("written once, never written back over"))
+	qt.Check(t, qt.HasLen(d.warns, 3), qt.Commentf("%v", d.warns))
+	qt.Check(t, qt.Equals(d.warns[2], "configuration import compensated after a failed section (tenant "+testTenant+", partial)"))
+}
+
+// The first section's write lost after it landed: nothing to restore, and the
+// import is partial, not failed.
+func TestTheFirstWriteLostAfterItLandedIsPartialNotFailed(t *testing.T) {
+	d := newDeployment(t)
+	d.orders.loseApply = 1
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial))
+	qt.Check(t, qt.Equals(imp.Answer.Sections["stock"].Status, document.SectionWithheld))
+}
+
+// A write whose answer was lost before anything was written leaves its section
+// as it was: the read-back finds the version the apply named, and the import
+// rolls back as for any failed section.
+func TestAWriteLostBeforeItLandedStillRollsBack(t *testing.T) {
+	d := newDeployment(t)
+	d.roles.dropApply = 1
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection, "rolebyte": rolesSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.RolledBack))
+	qt.Check(t, qt.HasLen(d.roles.written, 0))
+	qt.Check(t, qt.Equals(imp.Answer.Sections["rolebyte"].Detail, ""))
+	// It was read back: once before the writes, once after its write was lost.
+	var reads int
+	for _, c := range callsTo(d.recorded(), http.MethodGet, "/config") {
+		if c.section == "rolebyte" {
+			reads++
+		}
+	}
+	qt.Check(t, qt.Equals(reads, 2))
+}
+
+// A server error after the owner wrote — a proxy's timeout in front of it, say —
+// is no clear answer either: the section is read back, and the import is
+// partial, not rolled back. So is a 200 whose body is no report.
+func TestAServerErrorOrAnUnreadableAnswerAfterTheWriteIsReadBack(t *testing.T) {
+	for name, tune := range map[string]func(s *stub){
+		"a 504 after the write":            func(s *stub) { s.gatewayAfterWrite = 1 },
+		"a 200 that is no report":          func(s *stub) { s.garbleAfterWrite = 1 },
+		"no answer at all after the write": func(s *stub) { s.loseApply = 1 },
+	} {
+		d := newDeployment(t)
+		tune(d.roles)
+
+		imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+			map[string]string{"orders": ordersSection, "rolebyte": `{"schema":"rolebyte-config/1","roles":[]}`}, allVersions), false)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial), qt.Commentf("%s", name))
+		qt.Check(t, qt.IsTrue(strings.Contains(imp.Answer.Sections["rolebyte"].Detail, "changed after the preview")), qt.Commentf("%s", name))
+		qt.Check(t, qt.Equals(imp.Answer.Sections["orders"].Status, document.SectionRolledBack), qt.Commentf("%s", name))
+	}
+}
+
+// An apply the token authority refused was never sent: that is a clear answer,
+// so nothing is read back and the import rolls back as for any refusal.
+func TestAnApplyTheAuthorityRefusedIsNotReadBack(t *testing.T) {
+	d := newDeployment(t)
+	d.roles.authorityRefuses = 1
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "rolebyte": rolesSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.RolledBack))
+	var reads int
+	for _, c := range callsTo(d.recorded(), http.MethodGet, "/config") {
+		if c.section == "rolebyte" {
+			reads++
+		}
+	}
+	qt.Check(t, qt.Equals(reads, 1), qt.Commentf("only the read before the writes"))
+}
+
+// A restore whose own answer is unclear says the section may hold either
+// version; a restore its owner refused (someone changed it since) says it holds
+// the document's version or that change.
+func TestARestoreWithoutAClearAnswerSaysMay(t *testing.T) {
+	d := newDeployment(t)
+	d.stock.failApply = 1
+	d.orders.loseApply = 2 // the restore
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial))
+	qt.Check(t, qt.IsTrue(strings.Contains(imp.Answer.Sections["orders"].Detail, "may hold the document's version or what it held before")))
+
+	d = newDeployment(t)
+	d.stock.failApply = 1
+	d.stock.failStatus = http.StatusConflict
+	d.orders.failApply = 2
+	d.orders.failStatus = http.StatusPreconditionFailed
+	d.orders.failBody = `{"code":"err:owner:config_version_moved","title":"Changed","status":412}`
+	imp, err = d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "stock": stockSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial))
+	qt.Check(t, qt.IsTrue(strings.HasSuffix(imp.Answer.Sections["orders"].Detail, "the document's version, or a change made since")))
+}
+
+// A read-back after the request ended is bounded by the transfer's own limit:
+// an owner that never answers it cannot hold the import for ever.
+func TestAReadBackIsBoundedAfterTheRequestEnded(t *testing.T) {
+	d := newDeployment(t)
+	d.roles.loseApply = 1
+	hang := transfer.CallerFunc(func(ctx context.Context, o *owners.Owner, scope, method, path string, header http.Header, body []byte) (*configclient.Response, error) {
+		if o.Section == "rolebyte" && method == http.MethodGet && d.roles.lost {
+			<-ctx.Done()
+
+			return nil, ctx.Err()
+		}
+
+		return d.Call(ctx, o, scope, method, path, header, body)
+	})
+	tr := d.transfer()
+	tr.AfterRequest = 50 * time.Millisecond
+
+	done := make(chan *transfer.Imported, 1)
+	go func() {
+		imp, err := tr.Import(context.Background(), everyone(), hang, importDoc(t,
+			map[string]string{"orders": ordersSection, "rolebyte": rolesSection}, allVersions), false)
+		qt.Check(t, qt.IsNil(err))
+		done <- imp
+	}()
+	select {
+	case imp := <-done:
+		qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial))
+		qt.Check(t, qt.IsTrue(strings.Contains(imp.Answer.Sections["rolebyte"].Detail, "could not be read back")))
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read-back after the request ended was not bounded")
+	}
+}
+
+// A body the kit reads as a problem but that carries no code of the fleet's
+// shape is no problem: only its status is kept. One that does keeps the status
+// the owner answered with, not the one in its body, and a title of one line.
+func TestAProblemWithoutACodeOrWithALongTitleIsKeptToItsPublicShape(t *testing.T) {
+	long := strings.Repeat("ā", 300)
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   map[string]any
+	}{
+		{http.StatusInternalServerError, `{"status":500}`, map[string]any{"code": "err:upstream:unavailable", "status": 502}},
+		{http.StatusConflict, `{"title":"x"}`, map[string]any{"code": "err:upstream:refused", "status": 409}},
+		{http.StatusConflict, `{"code":"err:owner:busy","title":"Busy","status":200}`, map[string]any{"code": "err:owner:busy", "title": "Busy", "status": 409}},
+		{http.StatusConflict, `{"code":"err:owner:busy","title":"` + long + `","status":409}`,
+			map[string]any{"code": "err:owner:busy", "title": strings.Repeat("ā", 200), "status": 409}},
+	} {
+		d := newDeployment(t)
+		d.orders.failApply = 1
+		d.orders.failStatus = tc.status
+		d.orders.failBody = tc.body
+
+		imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+			map[string]string{"orders": ordersSection}, map[string]string{"orders": "sha256:orders"}), false)
+		qt.Assert(t, qt.IsNil(err))
+		qt.Check(t, qt.JSONEquals([]byte(imp.Answer.Sections["orders"].Problem), tc.want), qt.Commentf("%d %.40s", tc.status, tc.body))
+	}
+}
+
+// A write whose answer was lost, on a section that then cannot be read either:
+// nobody can tell whether it landed, so the import is partial and the line says
+// it may hold the document.
+func TestALostWriteWhoseSectionCannotBeReadBackIsPartial(t *testing.T) {
+	d := newDeployment(t)
+	d.roles.loseApply = 1
+	d.roles.unreadableAfterLoss = true
+
+	imp, err := d.transfer().Import(context.Background(), everyone(), d, importDoc(t,
+		map[string]string{"orders": ordersSection, "rolebyte": rolesSection}, allVersions), false)
+	qt.Assert(t, qt.IsNil(err))
+	qt.Check(t, qt.Equals(imp.Answer.Outcome, document.Partial))
+	qt.Check(t, qt.IsTrue(strings.Contains(imp.Answer.Sections["rolebyte"].Detail, "could not be read back")))
+	qt.Check(t, qt.Equals(imp.Answer.Sections["orders"].Status, document.SectionRolledBack))
 }

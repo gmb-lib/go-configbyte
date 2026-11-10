@@ -176,9 +176,11 @@ The export asks every owner the person holds anything of for its section, as an 
 one refuses or cannot be reached. The dry run asks each owner to preview its section and answers each one's
 version. The apply names those versions: it stops when one moved, writes nothing when one section is refused,
 then writes the sections in the owners' order and, when a later one fails, restores the ones already written,
-newest first. A section no owner holds, or whose owner the person holds nothing of, is reported skipped. Every
-owner judges every call with the person's own scopes; the transfer adds no rule of its own, and never sees a
-session or a token.
+newest first. A write that produced no answer is read back: when its section moved, or cannot be read, the import
+is `partial` and the section is not written back over. A section no owner holds, or whose owner the person holds
+nothing of, is reported skipped. A section's line carries only the public part of an owner's refusal or failure,
+since the answer is a 200 that the host's own error projection never sees. Every owner judges every call with the
+person's own scopes; the transfer adds no rule of its own, and never sees a session or a token.
 
 ## Proving it
 
