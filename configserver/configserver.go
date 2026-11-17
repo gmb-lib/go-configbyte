@@ -400,7 +400,15 @@ func (o *Owner) run(ctx *azugo.Context, dryRun bool) {
 	}
 
 	// Copied for the same reason, so a store may keep the document it is handed.
-	body := bytes.Clone(ctx.Body.Bytes())
+	raw, err := ctx.Body.Bytes()
+	if err != nil {
+		// A body over the framework's limit answers 413, an unreadable one 400.
+		ctx.Error(err)
+
+		return
+	}
+
+	body := bytes.Clone(raw)
 	if !json.Valid(body) {
 		// The same reason the store answers a document it cannot read, so a
 		// request fault renders exactly like a document fault.

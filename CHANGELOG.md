@@ -4,6 +4,15 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v0.5.0
+
+**Requires Go 1.27.4** (was 1.27.3) **and brings Azugo v0.50** to a service that imports `configserver`. No exported symbol or signature changed.
+
+### Changed
+
+- **`configserver`'s apply route reads its request body through the framework's checked read.** A body over the framework's limit now answers 413 and an unreadable one 400, through `ctx.Error`, where Azugo v0.40 read it unchecked. A service that takes this version inherits the limit (the route's `ctx.SetMaxBodySize`, else `SERVER_MAX_REQUEST_BODY_SIZE`, else 4 MiB), so a service whose configuration import is larger than 4 MiB must set its own.
+- Azugo v0.50.2, Azugo Core v0.50.1 and fasthttp v1.79.0, `github.com/gmb-lib/go-authbyte` → v0.46.0 and `github.com/gmb-lib/go-platform-kit` → v1.13.0, with the remaining dependency graph refreshed. A service that takes this version inherits Azugo v0.50: `ctx.Body.Bytes()`, `ctx.Form.Values()`, `StringOptional()`, `FileOptional()` and `Files()` now return `(value, error)` and stop the build until the error is handled (answer it with `ctx.Error(err)`); a form or multipart body is read only when a handler asks for it; a gzip multipart body is held to the limit after unpacking.
+
 ## v0.4.1
 
 Two fixes in `transfer`. Code that uses it compiles and runs unchanged, but both change what an import answers in
